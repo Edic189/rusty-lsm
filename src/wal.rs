@@ -1,4 +1,3 @@
-// src/wal.rs (Final Clean Version)
 use crate::error::Result;
 use bytes::{BufMut, Bytes};
 use std::path::{Path, PathBuf};

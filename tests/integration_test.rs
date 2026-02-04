@@ -1,4 +1,3 @@
-// tests/integration_test.rs
 use bytes::Bytes;
 use rusty_lsm::engine::StorageEngine;
 use tempfile::tempdir;
@@ -20,7 +19,7 @@ async fn test_crash_recovery() {
             .await
             .unwrap();
         engine.delete(Bytes::from("key2")).await.unwrap();
-    } // Engine drops here
+    } // Engine drops here (simulating crash)
 
     // 2. Restart Engine (Recovery)
     {

@@ -1,4 +1,3 @@
-// src/engine.rs
 use crate::error::Result;
 use crate::memtable::MemTable;
 use crate::sstable::{builder::SstBuilder, reader::SstReader};
@@ -10,7 +9,6 @@ use tokio::fs;
 use tokio::sync::RwLock;
 
 pub struct StorageEngine {
-    /// Directory where WAL and SSTables are stored.
     dir: PathBuf,
 
     /// The Write-Ahead Log for durability.
