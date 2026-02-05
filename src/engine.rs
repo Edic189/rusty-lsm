@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::manifest::ManifestManager; // <--- NOVO
+use crate::manifest::ManifestManager;
 use crate::memtable::MemTable;
 use crate::merge::MergeIterator;
 use crate::sstable::{builder::SstBuilder, reader::SstReader};
@@ -9,14 +9,14 @@ use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
-use tokio::sync::{Mutex, RwLock}; // Treba nam Mutex za manifest
+use tokio::sync::{Mutex, RwLock};
 
 pub struct StorageEngine {
     dir: PathBuf,
     wal: Wal,
     memtable: RwLock<Arc<MemTable>>,
     sstables: RwLock<Vec<Arc<SstReader>>>,
-    manifest: Arc<Mutex<ManifestManager>>, // <--- NOVO: Čuva stanje
+    manifest: Arc<Mutex<ManifestManager>>,
 }
 
 impl StorageEngine {
@@ -125,7 +125,6 @@ impl StorageEngine {
         let sst_guard = self.sstables.read().await;
         let mut iterators = Vec::new();
         for sst in sst_guard.iter() {
-            // FIX: Dodan lifetime cast da umirimo compiler oko Box-a
             let iter = sst
                 .scan(start_slice)
                 .map(|(k, v)| (k.to_vec(), v.map(|x| x.to_vec())));
@@ -193,45 +192,65 @@ impl StorageEngine {
     }
 
     pub async fn compact(&self) -> Result<()> {
+        // 1. Faza SELEKCIJE: Tražimo samo Level 0 datoteke
         let candidates: Vec<Arc<SstReader>>;
         let candidate_ids: Vec<u128>;
+
         {
-            let guard = self.sstables.read().await;
-            if guard.len() <= 1 {
+            // Zaključamo manifest samo kratko da vidimo što imamo
+            let manifest = self.manifest.lock().await;
+            let active_files = manifest.get_active_files();
+
+            // Filtriramo samo one koje su na Levelu 0
+            let l0_ids: Vec<u128> = active_files
+                .iter()
+                .filter(|f| f.level == 0)
+                .map(|f| f.id)
+                .collect();
+
+            // Prag: Pokreni kompakciju samo ako imamo barem 2 L0 datoteke
+            if l0_ids.len() < 2 {
+                tracing::info!(
+                    "Skipping compaction: only {} L0 files (need 2+)",
+                    l0_ids.len()
+                );
                 return Ok(());
             }
-            candidates = guard.clone();
 
-            // Izvuci ID iz patha (malo hacky, ali radi za sada)
-            // Pretpostavka: filename je "123456789.sst"
-            candidate_ids = candidates
+            // Sada nađemo stvarne SstReadere za te ID-eve
+            let guard = self.sstables.read().await;
+            candidates = guard
                 .iter()
-                .map(|c| {
-                    c.path
+                .filter(|sst| {
+                    // Izvlačimo ID iz imena datoteke
+                    let id = sst
+                        .path
                         .file_stem()
                         .unwrap()
                         .to_str()
                         .unwrap()
                         .parse::<u128>()
-                        .unwrap()
+                        .unwrap();
+                    l0_ids.contains(&id)
                 })
+                .cloned()
                 .collect();
+
+            candidate_ids = l0_ids;
         }
 
-        tracing::info!("Compacting {} files...", candidates.len());
+        tracing::info!("Starting compaction of {} L0 files...", candidates.len());
 
         let dir_clone = self.dir.clone();
-        // Moramo klonirati pathove za thread
         let candidate_paths: Vec<PathBuf> = candidates.iter().map(|c| c.path.clone()).collect();
 
-        // Izvrši merge u threadu
+        // 2. Faza IZVRŠENJA (Heavy lifting u threadu)
         let new_sst_path = tokio::task::spawn_blocking(move || {
             Self::run_compaction_logic(candidate_paths, dir_clone)
         })
         .await
         .map_err(|e| crate::error::LsmError::Serialization(e.to_string()))??;
 
-        // Novi ID iz patha
         let new_id = new_sst_path
             .file_stem()
             .unwrap()
@@ -240,19 +259,19 @@ impl StorageEngine {
             .parse::<u128>()
             .unwrap();
 
-        // 3. Ažuriraj Manifest (Atomski swap)
+        // 3. Faza AŽURIRANJA (Manifest)
         {
             let mut manifest = self.manifest.lock().await;
-            // Dodaj novu (Level 1 - jer je compacted)
+            // Rezultat L0 kompakcije ide u Level 1
             manifest.add_file(new_id, 1).await?;
-            // Obriši stare
+            // Mičemo samo one L0 datoteke koje smo spojili
             manifest.remove_files(&candidate_ids).await?;
         }
 
-        // 4. Ažuriraj memoriju
+        // 4. Faza AŽURIRANJA (Memorija / SSTables)
         {
             let mut guard = self.sstables.write().await;
-            // Makni stare
+            // Izbaci stare readere iz memorije
             guard.retain(|sst| {
                 let id = sst
                     .path
@@ -264,27 +283,37 @@ impl StorageEngine {
                     .unwrap();
                 !candidate_ids.contains(&id)
             });
-            // Dodaj novu
+
+            // Dodaj novi reader
             let new_reader = SstReader::open(&new_sst_path)?;
             guard.push(Arc::new(new_reader));
+
+            // Bitno: Sortiramo listu readera (stariji -> noviji) da bi Get radio ispravno
+            guard.sort_by_key(|r| {
+                r.path
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .parse::<u128>()
+                    .unwrap()
+            });
         }
 
-        // 5. Obriši stare datoteke s diska
+        // 5. Cleanup (Brisanje s diska)
         for reader in candidates {
             let _ = fs::remove_file(&reader.path).await;
         }
 
         tracing::info!(
-            "Compaction complete. Created Level 1 SST: {:?}",
+            "Compaction complete. {} L0 files merged into Level 1: {:?}",
+            candidate_ids.len(),
             new_sst_path
         );
         Ok(())
     }
 
     fn run_compaction_logic(files: Vec<PathBuf>, dir: PathBuf) -> Result<PathBuf> {
-        // ... (Kod ostaje isti kao prije, samo ga trebaš ostaviti tu)
-        // Kopiraj logiku iz prošlog odgovora za run_compaction_logic
-        // Samo pazi da koristiš isti "id" generiranje kao u flushu
         let mut readers = Vec::new();
         for path in &files {
             let reader = SstReader::open(path)?;
@@ -312,7 +341,7 @@ impl StorageEngine {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(async { builder.build(merge_iter, 0).await })?; // approx_items 0 is fine
+        rt.block_on(async { builder.build(merge_iter, 0).await })?;
 
         Ok(new_path)
     }
