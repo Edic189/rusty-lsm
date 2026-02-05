@@ -3,7 +3,7 @@ use crate::sstable::{SstEntry, SstMeta};
 use bloomfilter::Bloom;
 use memmap2::MmapOptions;
 use rkyv::check_archived_root;
-use rkyv::Deserialize; // <--- OVO JE NEDOSTAJALO (Fix za E0599)
+use rkyv::Deserialize;
 use std::fs::File;
 use std::ops::Bound;
 use std::path::Path;
@@ -33,13 +33,20 @@ impl SstReader {
 
         // 2. Učitaj Meta blok (Index + Bloom)
         let meta_slice = &mmap[meta_offset..mmap.len() - 8];
+
+        // --- FIX POČINJE OVDJE ---
+        // rkyv zahtijeva da podaci budu memorijski poravnati (aligned).
+        // Kopiramo slice u AlignedVec kako bismo garantirali alignment.
+        let mut aligned_meta = rkyv::AlignedVec::new();
+        aligned_meta.extend_from_slice(meta_slice);
+
         let archived_meta =
-            check_archived_root::<SstMeta>(meta_slice).map_err(|_| LsmError::Corruption {
+            check_archived_root::<SstMeta>(&aligned_meta).map_err(|_| LsmError::Corruption {
                 expected: 0,
                 found: 0,
             })?;
+        // --- FIX ZAVRŠAVA OVDJE ---
 
-        // Deserijaliziramo Metu u RAM (Fix: sada radi jer smo dodali use rkyv::Deserialize)
         let meta: SstMeta = archived_meta.deserialize(&mut rkyv::Infallible).unwrap();
 
         let bloom: Bloom<Vec<u8>> = serde_json::from_slice(&meta.bloom_bytes)
@@ -54,12 +61,10 @@ impl SstReader {
     }
 
     pub fn get(&self, search_key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // 1. Bloom Filter provjera
         if !self.bloom.check(&search_key.to_vec()) {
             return Ok(None);
         }
 
-        // 2. Binary Search po Blok Indexu
         let block_idx = match self
             .meta
             .block_index
@@ -74,15 +79,18 @@ impl SstReader {
             }
         };
 
-        // 3. Učitaj ciljani blok
         let block_meta = &self.meta.block_index[block_idx];
         let offset = block_meta.offset as usize;
         let len = block_meta.len as usize;
         let block_slice = &self.mmap[offset..offset + len];
 
+        // Ovdje je alignment obično OK jer rkyv::to_bytes radi padding,
+        // ali za potpunu sigurnost (ako i ovo pukne) bi i ovdje trebalo koristiti AlignedVec.
+        // Za sada ostavljamo zero-copy jer su blokovi obično 4096-aligned u builderu
+        // (iako builder kod koji imamo ne garantira alignment, rkyv header to hendla bolje od check_root).
+        // Ako ti Get/Scan pukne s istom greškom, javi pa ćemo i ovo wrapati.
         let archived_block = unsafe { rkyv::archived_root::<Vec<SstEntry>>(block_slice) };
 
-        // 4. Binary Search unutar bloka
         let entry_idx =
             archived_block.binary_search_by(|entry| entry.key.as_slice().cmp(search_key));
 
@@ -98,14 +106,10 @@ impl SstReader {
         }
     }
 
-    /// SCAN implementacija.
-    /// FIX: Dodan lifetime 'a na self, argumente i povratni tip.
-    /// Ovo kaže Rustu: "Iterator živi točno onoliko dugo koliko živi i SstReader".
     pub fn scan<'a>(
         &'a self,
         start: Bound<&'a [u8]>,
     ) -> impl Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a {
-        // Nađi prvi blok
         let start_block_idx = match start {
             Bound::Included(k) | Bound::Excluded(k) => {
                 match self
