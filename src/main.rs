@@ -1,16 +1,15 @@
-// src/main.rs
 use anyhow::Result;
 use rusty_lsm::engine::StorageEngine;
 use std::io::{self, Write};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing for observability
+    // Initialize tracing
     tracing_subscriber::fmt::init();
 
     let engine = StorageEngine::new("./db_data").await?;
     println!("--- Rusty LSM-Tree Engine Loaded ---");
-    println!("Commands: put [k] [v], get [k], delete [k], flush, exit");
+    println!("Commands: put [k] [v], get [k], delete [k], flush, compact, exit");
 
     loop {
         print!("> ");
@@ -36,6 +35,11 @@ async fn main() -> Result<()> {
             ["flush"] => {
                 engine.flush().await?;
                 println!("Flush complete.");
+            }
+            ["compact"] => {
+                println!("Compacting SSTables...");
+                engine.compact().await?;
+                println!("Compaction complete.");
             }
             ["exit"] => break,
             _ => println!("Unknown command."),

@@ -3,6 +3,7 @@ use crate::memtable::MemTable;
 use crate::sstable::{builder::SstBuilder, reader::SstReader};
 use crate::wal::Wal;
 use bytes::Bytes;
+use std::collections::BTreeMap; // Treba nam za sortiranje pri kompaktu
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
@@ -86,24 +87,17 @@ impl StorageEngine {
     }
 
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // 1. Provjeri MemTable
         {
             let mem = self.memtable.read().await;
             match mem.get(key) {
-                Some(Some(val)) => return Ok(Some(val.to_vec())), // Nađeno
-                Some(None) => return Ok(None), // Nađen Tombstone -> PODATAK JE OBRISAN, STANI.
-                None => {}                     // Nije u memoriji, traži dalje na disku
+                Some(Some(val)) => return Ok(Some(val.to_vec())),
+                Some(None) => return Ok(None),
+                None => {}
             }
         }
 
-        // 2. Provjeri SSTables (od najnovije prema najstarijoj)
         let sstables = self.sstables.read().await;
         for sst in sstables.iter().rev() {
-            // Ovdje također moramo paziti: ako SST vrati Tombstone, moramo stati!
-            // Trenutni SstReader::get vraća Option<Vec<u8>>, što skriva Tombstone.
-            // Za pravi fix, SstReader bi trebao vraćati enum, ali za sada
-            // pretpostavljamo da ako SstReader vrati Ok(Some(v)), to je vrijednost.
-            // (Napomena: Ovo je još jedna točka za buduće poboljšanje)
             if let Some(val) = sst.get(key)? {
                 return Ok(Some(val));
             }
@@ -115,7 +109,6 @@ impl StorageEngine {
     pub async fn flush(&self) -> Result<()> {
         let old_memtable;
 
-        // 1. Zamjena MemTable-a (brzi lock)
         {
             let mut guard = self.memtable.write().await;
             old_memtable = guard.clone();
@@ -126,7 +119,6 @@ impl StorageEngine {
             return Ok(());
         }
 
-        // 2. Zapiši SST na disk
         let id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -136,19 +128,85 @@ impl StorageEngine {
         let builder = SstBuilder::new(&sst_path);
         builder.build_from_memtable(&old_memtable).await?;
 
-        // 3. Dodaj u listu čitača
         let reader = SstReader::open(&sst_path)?;
         {
             let mut sst_guard = self.sstables.write().await;
             sst_guard.push(reader);
         }
 
-        // 4. OČISTI WAL [NOVO]
-        // Budući da su podaci sada sigurni u SST datoteci,
-        // stari WAL nam više ne treba za oporavak.
         self.wal.reset().await?;
 
-        tracing::info!("Flushed MemTable to {:?} and reset WAL", sst_path);
+        tracing::info!("Flushed MemTable to {:?}", sst_path);
+
+        Ok(())
+    }
+
+    /// NOVO: Kompaktiranje
+    /// Spaja sve SST datoteke u jednu, uklanja duplikate i obrisane podatke.
+    pub async fn compact(&self) -> Result<()> {
+        // 1. Uzimamo WRITE lock jer ćemo mijenjati strukturu sstables
+        let mut sstables_guard = self.sstables.write().await;
+
+        if sstables_guard.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!("Starting compaction of {} tables...", sstables_guard.len());
+
+        // 2. Mapiranje u memoriji (Sorted Map)
+        // BTreeMap automatski sortira po ključu.
+        // Ključ je Vec<u8>, Vrijednost je Option<Vec<u8>> (None znači tombstone)
+        let mut map: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+
+        // 3. Iteriramo od NAJSTARIJE prema NAJNOVIJOJ tablici.
+        // To osigurava da noviji podaci (čak i tombstones) pregaze stare.
+        for sst in sstables_guard.iter() {
+            for (key, value) in sst.iter() {
+                map.insert(key.to_vec(), value.map(|v| v.to_vec()));
+            }
+        }
+
+        // 4. Izradi novu SST datoteku
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        let new_sst_path = self.dir.join(format!("{}_compacted.sst", id));
+
+        // Moramo ručno napraviti MemTable ili adaptirati Builder.
+        // Ovdje ćemo koristiti trik: Napraviti privremeni MemTable da iskoristimo postojeći Builder logic.
+        // (U optimiziranoj verziji Builder bi primao Iterator, ali ovo je lakše za MVP)
+        let temp_memtable = MemTable::new();
+        for (key, value) in map {
+            if let Some(val) = value {
+                let _ = temp_memtable.put(Bytes::from(key), Bytes::from(val));
+            } else {
+                // Ako je zadnje stanje Tombstone, u Full Compaction ga možemo čak i izbaciti
+                // ako smo sigurni da nema starijih snapshotova koji se koriste.
+                // Za sigurnost, zadržimo ga kao delete marker.
+                let _ = temp_memtable.delete(Bytes::from(key));
+            }
+        }
+
+        let builder = SstBuilder::new(&new_sst_path);
+        builder.build_from_memtable(&temp_memtable).await?;
+
+        // 5. Otvori novu datoteku
+        let new_reader = SstReader::open(&new_sst_path)?;
+
+        // 6. Zamijeni listu sstables sa novom listom koja ima samo ovu jednu datoteku
+        // Prvo skupimo putanje starih datoteka da ih možemo obrisati
+        let old_files: Vec<PathBuf> = sstables_guard.iter().map(|r| r.path.clone()).collect();
+
+        // Postavi novu listu
+        *sstables_guard = vec![new_reader];
+
+        // 7. Obriši stare datoteke s diska
+        for path in old_files {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+
+        tracing::info!("Compaction complete. New SST: {:?}", new_sst_path);
 
         Ok(())
     }
