@@ -43,13 +43,11 @@ async fn main() -> Result<()> {
                 let start_b = Bound::Included(start.as_bytes().to_vec());
                 let end_b = Bound::Excluded(end.as_bytes().to_vec());
 
-                // 'results' je sada iterator, ne vektor
                 let results = engine.scan((start_b, end_b)).await?;
 
                 let mut count = 0;
                 println!("Scanning items...");
 
-                // Iteriramo kroz stream
                 for (k, v) in results {
                     println!(
                         "{} = {}",

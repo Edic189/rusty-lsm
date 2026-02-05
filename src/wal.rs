@@ -37,9 +37,6 @@ impl Wal {
         let ops_bytes = bincode::serialize(ops)
             .map_err(|e| crate::error::LsmError::Serialization(e.to_string()))?;
 
-        // Format: [CRC (4)] [LEN (8)] [DATA (N)]
-        // CRC se računa nad [LEN] + [DATA]
-
         let mut payload = Vec::with_capacity(8 + ops_bytes.len());
         payload.put_u64(ops_bytes.len() as u64);
         payload.put_slice(&ops_bytes);

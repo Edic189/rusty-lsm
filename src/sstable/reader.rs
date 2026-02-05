@@ -152,7 +152,6 @@ impl SstReader {
     }
 }
 
-// NOVO: Iterator struct koji posjeduje Arc<Reader>
 pub struct SstIterator {
     reader: Arc<SstReader>,
     current_block_idx: usize,
@@ -182,7 +181,6 @@ impl SstIterator {
             Bound::Unbounded => 0,
         };
 
-        // Konvertujemo bound u Vec<u8> za struct
         let end_bound = match end {
             Bound::Included(b) => Bound::Included(b.to_vec()),
             Bound::Excluded(b) => Bound::Excluded(b.to_vec()),
@@ -196,12 +194,8 @@ impl SstIterator {
             end_bound,
         };
 
-        // Odmah učitaj prvi blok i premotaj do start ključa
-        if let Err(_) = iter.load_next_block() {
-            // Ako ne uspjemo učitati, iter je prazan
-        }
+        if let Err(_) = iter.load_next_block() {}
 
-        // Skip keys prije start bound-a unutar prvog bloka
         if !iter.current_entries.is_empty() {
             match start {
                 Bound::Included(k) => {
@@ -259,7 +253,6 @@ impl Iterator for SstIterator {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some((key, val)) = self.current_entries.pop_front() {
-                // Provjera end bound-a
                 match &self.end_bound {
                     Bound::Included(end) => {
                         if &key > end {
@@ -276,17 +269,15 @@ impl Iterator for SstIterator {
                 return Some((key, val));
             }
 
-            // Ako je red prazan, probaj učitati sljedeći blok
             if self.current_block_idx < self.reader.meta.block_index.len() {
                 if let Err(_) = self.load_next_block() {
                     return None;
                 }
-                // Ako je i nakon load-a prazan (prazan blok?), probaj opet loop
                 if self.current_entries.is_empty() {
-                    return None; // Kraj fajla
+                    return None;
                 }
             } else {
-                return None; // Nema više blokova
+                return None;
             }
         }
     }

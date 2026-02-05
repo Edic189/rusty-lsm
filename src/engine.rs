@@ -1,11 +1,11 @@
 use crate::batch::{BatchOp, WriteBatch};
 use crate::cache::BlockCache;
 use crate::error::Result;
-use crate::iterator::StorageIterator; // Import
+use crate::iterator::StorageIterator;
 use crate::manifest::ManifestManager;
 use crate::memtable::MemTable;
 use crate::merge::MergeIterator;
-use crate::sstable::{builder::SstBuilder, reader::SstIterator, reader::SstReader}; // Import SstIterator
+use crate::sstable::{builder::SstBuilder, reader::SstIterator, reader::SstReader};
 use crate::wal::Wal;
 use bytes::Bytes;
 use std::ops::Bound;
@@ -29,11 +29,6 @@ const LN_THRESHOLD: usize = 4;
 const CACHE_CAPACITY: usize = 1000;
 
 impl StorageEngine {
-    // ... new, write, put, delete, get, flush ostaju ISTI ...
-
-    // Moraš zadržati ove metode (new, write, put, delete, get, flush) u kodu,
-    // ovdje pišem samo ono što se mijenja (scan i compact helper)
-
     pub async fn new(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir).await?;
@@ -165,7 +160,6 @@ impl StorageEngine {
         Ok(())
     }
 
-    // --- NOVA SCAN IMPLEMENTACIJA ---
     pub async fn scan(
         &self,
         range: impl std::ops::RangeBounds<Vec<u8>>,
@@ -173,7 +167,6 @@ impl StorageEngine {
         let start_bound = range.start_bound();
         let end_bound = range.end_bound();
 
-        // Konverzija bound-a
         let start_bytes = match start_bound {
             Bound::Included(v) => Bound::Included(v.as_slice()),
             Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
@@ -185,8 +178,6 @@ impl StorageEngine {
             Bound::Unbounded => Bound::Unbounded,
         };
 
-        // Memtable iterator - skupljamo u Vec da bi izbjegli lifetime probleme sa read lockom
-        // Ovo je "snapshot" memtable-a
         let mem_vec: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
             let mem_guard = self.memtable.read().await;
             mem_guard
@@ -196,25 +187,18 @@ impl StorageEngine {
         };
         let mem_iter = mem_vec.into_iter();
 
-        // SSTable iterators
         let sst_guard = self.sstables.read().await;
         let mut iterators: Vec<Box<dyn Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>>> = Vec::new();
 
         for sst in sst_guard.iter() {
-            // SstIterator sada posjeduje (cloned) Arc<SstReader>, pa je siguran
             let iter = SstIterator::new(sst.clone(), start_bytes, end_bytes);
             iterators.push(Box::new(iter));
         }
 
-        // Dodamo memtable iter
         iterators.push(Box::new(mem_iter));
 
-        // Vraćamo wrapper
         Ok(StorageIterator::new(iterators))
     }
-
-    // --- COMPACT METODA ---
-    // Potrebna mala izmjena u compact i run_compaction_logic da koriste novi SstIterator
 
     pub async fn compact(&self) -> Result<()> {
         let (target_level, candidate_ids) = {
@@ -312,7 +296,6 @@ impl StorageEngine {
         is_last_level: bool,
     ) -> Result<PathBuf> {
         let mut readers = Vec::new();
-        // Ovdje ne koristimo cache za kompakciju da ne bi zagušili cache za čitanje
         for (path, id) in &files {
             let reader = Arc::new(SstReader::open(path, *id, None)?);
             readers.push(reader);
