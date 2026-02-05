@@ -15,6 +15,8 @@ pub struct SstEntry {
 pub struct SstMeta {
     pub block_index: Vec<BlockMeta>,
     pub bloom_bytes: Vec<u8>,
+    pub min_key: Vec<u8>,
+    pub max_key: Vec<u8>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]

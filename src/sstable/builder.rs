@@ -12,6 +12,8 @@ pub struct SstBuilder {
     block_index: Vec<BlockMeta>,
     current_block_size: usize,
     bloom: Bloom<Vec<u8>>,
+    min_key: Vec<u8>,
+    max_key: Vec<u8>,
 }
 
 impl SstBuilder {
@@ -25,10 +27,12 @@ impl SstBuilder {
             block_index: Vec::new(),
             current_block_size: 0,
             bloom,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
         }
     }
 
-    pub async fn build<I>(mut self, iter: I, _approx_items: usize) -> Result<()>
+    pub async fn build<I>(mut self, iter: I, compact_to_bottom_level: bool) -> Result<()>
     where
         I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
     {
@@ -41,13 +45,24 @@ impl SstBuilder {
 
         let mut writer = BufWriter::new(file);
         let mut file_offset = 0u64;
+        let mut first_entry = true;
 
         for (key, value) in iter {
+            if compact_to_bottom_level && value.is_none() {
+                continue;
+            }
+
             self.bloom.set(&key);
 
-            let entry_size = key.len() + value.as_ref().map(|v| v.len()).unwrap_or(0) + 8;
+            if first_entry {
+                self.min_key = key.clone();
+                first_entry = false;
+            }
+            self.max_key = key.clone();
 
+            let entry_size = key.len() + value.as_ref().map(|v| v.len()).unwrap_or(0) + 8;
             let entry = SstEntry { key, value };
+
             self.current_block.push(entry);
             self.current_block_size += entry_size;
 
@@ -66,6 +81,8 @@ impl SstBuilder {
         let meta = SstMeta {
             block_index: self.block_index,
             bloom_bytes,
+            min_key: self.min_key,
+            max_key: self.max_key,
         };
 
         let meta_bytes = rkyv::to_bytes::<_, 4096>(&meta)
@@ -73,7 +90,6 @@ impl SstBuilder {
 
         let meta_offset = file_offset;
         writer.write_all(&meta_bytes).await?;
-
         writer.write_u64(meta_offset).await?;
 
         writer.flush().await?;
@@ -96,7 +112,16 @@ impl SstBuilder {
         let block_bytes = rkyv::to_bytes::<_, 4096>(&self.current_block)
             .map_err(|e| crate::error::LsmError::Serialization(e.to_string()))?;
 
-        let len = block_bytes.len() as u64;
+        let mut encoder = snap::raw::Encoder::new();
+        let compressed_bytes = encoder.compress_vec(&block_bytes).map_err(|e| {
+            crate::error::LsmError::Serialization(format!("Compression error: {}", e))
+        })?;
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&compressed_bytes);
+        let checksum = hasher.finalize();
+
+        let len = (compressed_bytes.len() + 4) as u64;
 
         self.block_index.push(BlockMeta {
             start_key: first_key,
@@ -104,7 +129,8 @@ impl SstBuilder {
             len,
         });
 
-        writer.write_all(&block_bytes).await?;
+        writer.write_all(&compressed_bytes).await?;
+        writer.write_u32(checksum).await?;
         *file_offset += len;
 
         self.current_block.clear();
@@ -114,13 +140,12 @@ impl SstBuilder {
     }
 
     pub async fn build_from_memtable(self, memtable: &MemTable) -> Result<()> {
-        let approx_items = memtable.approximate_size() / 50;
         let iter = memtable.iter().map(|entry| {
             let key = entry.key().to_vec();
             let value = entry.value().as_ref().map(|b| b.to_vec());
             (key, value)
         });
 
-        self.build(iter, approx_items).await
+        self.build(iter, false).await
     }
 }

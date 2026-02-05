@@ -43,26 +43,38 @@ async fn main() -> Result<()> {
                 let start_b = Bound::Included(start.as_bytes().to_vec());
                 let end_b = Bound::Excluded(end.as_bytes().to_vec());
 
+                // 'results' je sada iterator, ne vektor
                 let results = engine.scan((start_b, end_b)).await?;
-                println!("Found {} items:", results.len());
+
+                let mut count = 0;
+                println!("Scanning items...");
+
+                // Iteriramo kroz stream
                 for (k, v) in results {
                     println!(
                         "{} = {}",
                         String::from_utf8_lossy(&k),
                         String::from_utf8_lossy(&v)
                     );
+                    count += 1;
                 }
+                println!("Total found: {}", count);
             }
             ["scan"] => {
                 let results = engine.scan(..).await?;
-                println!("Found {} items:", results.len());
+
+                let mut count = 0;
+                println!("Scanning all items...");
+
                 for (k, v) in results {
                     println!(
                         "{} = {}",
                         String::from_utf8_lossy(&k),
                         String::from_utf8_lossy(&v)
                     );
+                    count += 1;
                 }
+                println!("Total found: {}", count);
             }
             ["flush"] => {
                 engine.flush().await?;

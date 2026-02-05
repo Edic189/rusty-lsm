@@ -1,3 +1,4 @@
+use crate::batch::BatchOp;
 use crate::error::Result;
 use bytes::{BufMut, Bytes};
 use std::io::SeekFrom;
@@ -30,37 +31,28 @@ impl Wal {
         })
     }
 
-    pub async fn append(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+    pub async fn write_batch(&self, ops: &[BatchOp]) -> Result<()> {
         let mut writer = self.writer.lock().await;
 
-        let val_len = value.map(|v| v.len()).unwrap_or(0);
-        let val_exists = value.is_some();
+        let ops_bytes = bincode::serialize(ops)
+            .map_err(|e| crate::error::LsmError::Serialization(e.to_string()))?;
 
-        let entry_size = 8 + 1 + 8 + key.len() + val_len;
-        let mut buf = Vec::with_capacity(entry_size);
+        // Format: [CRC (4)] [LEN (8)] [DATA (N)]
+        // CRC se računa nad [LEN] + [DATA]
 
-        buf.put_u64(key.len() as u64);
-        if val_exists {
-            buf.put_u8(1);
-            buf.put_u64(val_len as u64);
-        } else {
-            buf.put_u8(0);
-            buf.put_u64(0);
-        }
-
-        buf.put_slice(key);
-        if let Some(v) = value {
-            buf.put_slice(v);
-        }
+        let mut payload = Vec::with_capacity(8 + ops_bytes.len());
+        payload.put_u64(ops_bytes.len() as u64);
+        payload.put_slice(&ops_bytes);
 
         let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&buf);
+        hasher.update(&payload);
         let checksum = hasher.finalize();
 
         writer.write_u32(checksum).await?;
-        writer.write_all(&buf).await?;
+        writer.write_all(&payload).await?;
 
         writer.flush().await?;
+        writer.get_ref().sync_all().await?;
 
         Ok(())
     }
@@ -76,23 +68,36 @@ impl Wal {
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             }
-            let _expected_crc = u32::from_be_bytes(crc_buf);
+            let expected_crc = u32::from_be_bytes(crc_buf);
 
-            let key_len = file.read_u64().await? as usize;
-            let is_val = file.read_u8().await? == 1;
-            let val_len = file.read_u64().await? as usize;
+            let mut len_buf = [0u8; 8];
+            file.read_exact(&mut len_buf).await?;
+            let data_len = u64::from_be_bytes(len_buf) as usize;
 
-            let mut key_bytes = vec![0u8; key_len];
-            file.read_exact(&mut key_bytes).await?;
+            let mut data = vec![0u8; data_len];
+            file.read_exact(&mut data).await?;
 
-            let mut val_bytes = None;
-            if is_val {
-                let mut v = vec![0u8; val_len];
-                file.read_exact(&mut v).await?;
-                val_bytes = Some(Bytes::from(v));
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&len_buf);
+            hasher.update(&data);
+            let computed_crc = hasher.finalize();
+
+            if computed_crc != expected_crc {
+                return Err(crate::error::LsmError::Corruption {
+                    expected: expected_crc,
+                    found: computed_crc,
+                });
             }
 
-            results.push((Bytes::from(key_bytes), val_bytes));
+            let ops: Vec<BatchOp> = bincode::deserialize(&data)
+                .map_err(|e| crate::error::LsmError::Serialization(e.to_string()))?;
+
+            for op in ops {
+                match op {
+                    BatchOp::Put(k, v) => results.push((Bytes::from(k), Some(Bytes::from(v)))),
+                    BatchOp::Delete(k) => results.push((Bytes::from(k), None)),
+                }
+            }
         }
 
         Ok(results)
@@ -105,9 +110,7 @@ impl Wal {
         let file = writer.get_mut();
 
         file.set_len(0).await?;
-
         file.seek(SeekFrom::Start(0)).await?;
-
         file.sync_all().await?;
 
         Ok(())
