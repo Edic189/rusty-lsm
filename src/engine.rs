@@ -19,6 +19,10 @@ pub struct StorageEngine {
     manifest: Arc<Mutex<ManifestManager>>,
 }
 
+const MAX_LEVELS: u32 = 7;
+const L0_THRESHOLD: usize = 2;
+const LN_THRESHOLD: usize = 4;
+
 impl StorageEngine {
     pub async fn new(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
@@ -27,12 +31,10 @@ impl StorageEngine {
         let wal_path = dir.join("wal.log");
         let wal = Wal::new(&wal_path).await?;
 
-        // 1. Učitaj Manifest
         let manifest = ManifestManager::new(&dir).await?;
         let active_files = manifest.get_active_files();
 
         let memtable = MemTable::new();
-        // Replay WAL
         let recovered_data = wal.replay().await?;
         for (key, value) in recovered_data {
             if let Some(val) = value {
@@ -42,7 +44,6 @@ impl StorageEngine {
             }
         }
 
-        // 2. Učitaj SAMO one SST datoteke koje su u Manifestu
         let mut sstables = Vec::new();
         for meta in active_files {
             let sst_path = dir.join(format!("{}.sst", meta.id));
@@ -51,6 +52,16 @@ impl StorageEngine {
                 sstables.push(Arc::new(reader));
             }
         }
+
+        sstables.sort_by_key(|r| {
+            r.path
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse::<u128>()
+                .unwrap()
+        });
 
         Ok(Self {
             dir,
@@ -89,7 +100,6 @@ impl StorageEngine {
         }
 
         let sstables = self.sstables.read().await;
-        // Čitamo od najnovije (zadnje u vektoru) prema najstarijoj
         for sst in sstables.iter().rev() {
             if let Some(val) = sst.get(key)? {
                 return Ok(Some(val));
@@ -128,6 +138,7 @@ impl StorageEngine {
             let iter = sst
                 .scan(start_slice)
                 .map(|(k, v)| (k.to_vec(), v.map(|x| x.to_vec())));
+
             iterators.push(Box::new(iter) as Box<dyn Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>>);
         }
 
@@ -166,24 +177,31 @@ impl StorageEngine {
         let id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_micros(); // ID datoteke
+            .as_micros();
 
         let sst_path = self.dir.join(format!("{}.sst", id));
 
         let builder = SstBuilder::new(&sst_path);
         builder.build_from_memtable(&old_memtable).await?;
 
-        // 1. Zapiši u Manifest da imamo novu datoteku (Level 0)
         {
             let mut manifest = self.manifest.lock().await;
             manifest.add_file(id, 0).await?;
         }
 
-        // 2. Dodaj u memoriju
         let reader = SstReader::open(&sst_path)?;
         {
             let mut sst_guard = self.sstables.write().await;
             sst_guard.push(Arc::new(reader));
+            sst_guard.sort_by_key(|r| {
+                r.path
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .parse::<u128>()
+                    .unwrap()
+            });
         }
 
         self.wal.reset().await?;
@@ -192,37 +210,53 @@ impl StorageEngine {
     }
 
     pub async fn compact(&self) -> Result<()> {
-        // 1. Faza SELEKCIJE: Tražimo samo Level 0 datoteke
-        let candidates: Vec<Arc<SstReader>>;
-        let candidate_ids: Vec<u128>;
-
-        {
-            // Zaključamo manifest samo kratko da vidimo što imamo
+        // 1. FAZA SELEKCIJE: Koristimo blok koji vraća tuple (level, ids)
+        // Time izbjegavamo "value assigned but never read" warning
+        let (target_level, candidate_ids) = {
             let manifest = self.manifest.lock().await;
             let active_files = manifest.get_active_files();
 
-            // Filtriramo samo one koje su na Levelu 0
-            let l0_ids: Vec<u128> = active_files
-                .iter()
-                .filter(|f| f.level == 0)
-                .map(|f| f.id)
-                .collect();
+            let mut result = None;
 
-            // Prag: Pokreni kompakciju samo ako imamo barem 2 L0 datoteke
-            if l0_ids.len() < 2 {
-                tracing::info!(
-                    "Skipping compaction: only {} L0 files (need 2+)",
-                    l0_ids.len()
-                );
-                return Ok(());
+            for level in 0..MAX_LEVELS {
+                let files_in_level: Vec<u128> = active_files
+                    .iter()
+                    .filter(|f| f.level == level)
+                    .map(|f| f.id)
+                    .collect();
+
+                let threshold = if level == 0 {
+                    L0_THRESHOLD
+                } else {
+                    LN_THRESHOLD
+                };
+
+                if files_in_level.len() >= threshold {
+                    tracing::info!(
+                        "Triggering compaction on Level {} ({} files)",
+                        level,
+                        files_in_level.len()
+                    );
+                    result = Some((level, files_in_level));
+                    break;
+                }
             }
+            // Vraćamo rezultat iz bloka, ako je None, rano prekidamo funkciju
+            match result {
+                Some(res) => res,
+                None => {
+                    tracing::info!("No compaction needed.");
+                    return Ok(());
+                }
+            }
+        };
 
-            // Sada nađemo stvarne SstReadere za te ID-eve
+        // 2. Dohvaćanje Readera na temelju ID-eva
+        let candidates: Vec<Arc<SstReader>> = {
             let guard = self.sstables.read().await;
-            candidates = guard
+            guard
                 .iter()
                 .filter(|sst| {
-                    // Izvlačimo ID iz imena datoteke
                     let id = sst
                         .path
                         .file_stem()
@@ -231,20 +265,24 @@ impl StorageEngine {
                         .unwrap()
                         .parse::<u128>()
                         .unwrap();
-                    l0_ids.contains(&id)
+                    candidate_ids.contains(&id)
                 })
                 .cloned()
-                .collect();
+                .collect()
+        };
 
-            candidate_ids = l0_ids;
-        }
-
-        tracing::info!("Starting compaction of {} L0 files...", candidates.len());
+        let next_level = target_level + 1;
+        tracing::info!(
+            "Compacting Level {} -> Level {} ({} files)...",
+            target_level,
+            next_level,
+            candidates.len()
+        );
 
         let dir_clone = self.dir.clone();
         let candidate_paths: Vec<PathBuf> = candidates.iter().map(|c| c.path.clone()).collect();
 
-        // 2. Faza IZVRŠENJA (Heavy lifting u threadu)
+        // 3. FAZA IZVRŠENJA
         let new_sst_path = tokio::task::spawn_blocking(move || {
             Self::run_compaction_logic(candidate_paths, dir_clone)
         })
@@ -259,19 +297,16 @@ impl StorageEngine {
             .parse::<u128>()
             .unwrap();
 
-        // 3. Faza AŽURIRANJA (Manifest)
+        // 4. AŽURIRANJE MANIFESTA
         {
             let mut manifest = self.manifest.lock().await;
-            // Rezultat L0 kompakcije ide u Level 1
-            manifest.add_file(new_id, 1).await?;
-            // Mičemo samo one L0 datoteke koje smo spojili
+            manifest.add_file(new_id, next_level).await?;
             manifest.remove_files(&candidate_ids).await?;
         }
 
-        // 4. Faza AŽURIRANJA (Memorija / SSTables)
+        // 5. AŽURIRANJE MEMORIJE
         {
             let mut guard = self.sstables.write().await;
-            // Izbaci stare readere iz memorije
             guard.retain(|sst| {
                 let id = sst
                     .path
@@ -284,11 +319,9 @@ impl StorageEngine {
                 !candidate_ids.contains(&id)
             });
 
-            // Dodaj novi reader
             let new_reader = SstReader::open(&new_sst_path)?;
             guard.push(Arc::new(new_reader));
 
-            // Bitno: Sortiramo listu readera (stariji -> noviji) da bi Get radio ispravno
             guard.sort_by_key(|r| {
                 r.path
                     .file_stem()
@@ -300,14 +333,14 @@ impl StorageEngine {
             });
         }
 
-        // 5. Cleanup (Brisanje s diska)
+        // 6. CLEANUP
         for reader in candidates {
             let _ = fs::remove_file(&reader.path).await;
         }
 
         tracing::info!(
-            "Compaction complete. {} L0 files merged into Level 1: {:?}",
-            candidate_ids.len(),
+            "Compaction complete. Merged into Level {}: {:?}",
+            next_level,
             new_sst_path
         );
         Ok(())
@@ -323,8 +356,9 @@ impl StorageEngine {
         let mut iterators = Vec::new();
         for reader in &readers {
             let iter = reader
-                .iter()
+                .scan(Bound::Unbounded)
                 .map(|(k, v)| (k.to_vec(), v.map(|x| x.to_vec())));
+
             iterators.push(Box::new(iter) as Box<dyn Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>>);
         }
 
