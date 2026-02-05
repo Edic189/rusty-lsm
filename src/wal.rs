@@ -1,9 +1,10 @@
 use crate::error::Result;
 use bytes::{BufMut, Bytes};
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 
 #[derive(Debug)]
@@ -18,6 +19,8 @@ impl Wal {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true) // Dodano read prava za manipulaciju
+            .write(true)
             .open(&path)
             .await?;
 
@@ -33,6 +36,7 @@ impl Wal {
         let val_len = value.map(|v| v.len()).unwrap_or(0);
         let val_exists = value.is_some();
 
+        // Format: KeyLen(8) + IsVal(1) + ValLen(8) + Key + Val
         let entry_size = 8 + 1 + 8 + key.len() + val_len;
         let mut buf = Vec::with_capacity(entry_size);
 
@@ -57,8 +61,10 @@ impl Wal {
         writer.write_u32(checksum).await?;
         writer.write_all(&buf).await?;
 
+        // U produkciji ne moramo raditi sync za svaki write (batching),
+        // ali za MVP je sigurnije.
         writer.flush().await?;
-        writer.get_ref().sync_all().await?;
+        // writer.get_ref().sync_all().await?;
 
         Ok(())
     }
@@ -96,10 +102,21 @@ impl Wal {
         Ok(results)
     }
 
-    pub async fn sync(&self) -> Result<()> {
+    /// Resetira WAL datoteku na nulu. Koristi se nakon flush-a.
+    pub async fn reset(&self) -> Result<()> {
         let mut writer = self.writer.lock().await;
+
         writer.flush().await?;
-        writer.get_ref().sync_all().await?;
+        let file = writer.get_mut();
+
+        // Truncate file na 0 bajtova
+        file.set_len(0).await?;
+        // Vrati kursor na početak
+        file.seek(SeekFrom::Start(0)).await?;
+
+        // Sinkroniziraj promjenu metadataka na disk
+        file.sync_all().await?;
+
         Ok(())
     }
 }

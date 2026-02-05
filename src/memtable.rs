@@ -27,9 +27,14 @@ impl MemTable {
         Ok(())
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<Bytes> {
+    /// Vraća:
+    /// - None: Ključ ne postoji u ovoj tablici.
+    /// - Some(None): Ključ postoji, ali je označen za brisanje (Tombstone).
+    /// - Some(Some(val)): Ključ postoji i ima vrijednost.
+    pub fn get(&self, key: &[u8]) -> Option<Option<Bytes>> {
         let entry = self.map.get(key)?;
-        entry.value().clone()
+        // Vraćamo kopiju Option<Bytes> unutar Entry-a
+        Some(entry.value().clone())
     }
 
     pub fn delete(&self, key: Bytes) -> MemResult<()> {
