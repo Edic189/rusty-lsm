@@ -40,7 +40,6 @@ async fn main() -> Result<()> {
                 println!("OK (tombstone set)");
             }
             ["scan", start, end] => {
-                // Range scan od start (uključivo) do end (isključivo)
                 let start_b = Bound::Included(start.as_bytes().to_vec());
                 let end_b = Bound::Excluded(end.as_bytes().to_vec());
 
@@ -55,7 +54,6 @@ async fn main() -> Result<()> {
                 }
             }
             ["scan"] => {
-                // Scan cijele baze
                 let results = engine.scan(..).await?;
                 println!("Found {} items:", results.len());
                 for (k, v) in results {

@@ -21,7 +21,6 @@ impl SstReader {
         let file = File::open(&path)?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
-        // 1. Pročitaj Footer (zadnjih 8 bajtova) da nađemo gdje počinje Meta
         if mmap.len() < 8 {
             return Err(LsmError::Corruption {
                 expected: 8,
@@ -31,12 +30,8 @@ impl SstReader {
         let meta_offset_bytes = &mmap[mmap.len() - 8..];
         let meta_offset = u64::from_be_bytes(meta_offset_bytes.try_into().unwrap()) as usize;
 
-        // 2. Učitaj Meta blok (Index + Bloom)
         let meta_slice = &mmap[meta_offset..mmap.len() - 8];
 
-        // --- FIX POČINJE OVDJE ---
-        // rkyv zahtijeva da podaci budu memorijski poravnati (aligned).
-        // Kopiramo slice u AlignedVec kako bismo garantirali alignment.
         let mut aligned_meta = rkyv::AlignedVec::new();
         aligned_meta.extend_from_slice(meta_slice);
 
@@ -45,7 +40,6 @@ impl SstReader {
                 expected: 0,
                 found: 0,
             })?;
-        // --- FIX ZAVRŠAVA OVDJE ---
 
         let meta: SstMeta = archived_meta.deserialize(&mut rkyv::Infallible).unwrap();
 
@@ -84,11 +78,6 @@ impl SstReader {
         let len = block_meta.len as usize;
         let block_slice = &self.mmap[offset..offset + len];
 
-        // Ovdje je alignment obično OK jer rkyv::to_bytes radi padding,
-        // ali za potpunu sigurnost (ako i ovo pukne) bi i ovdje trebalo koristiti AlignedVec.
-        // Za sada ostavljamo zero-copy jer su blokovi obično 4096-aligned u builderu
-        // (iako builder kod koji imamo ne garantira alignment, rkyv header to hendla bolje od check_root).
-        // Ako ti Get/Scan pukne s istom greškom, javi pa ćemo i ovo wrapati.
         let archived_block = unsafe { rkyv::archived_root::<Vec<SstEntry>>(block_slice) };
 
         let entry_idx =

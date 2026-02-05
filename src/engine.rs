@@ -210,8 +210,6 @@ impl StorageEngine {
     }
 
     pub async fn compact(&self) -> Result<()> {
-        // 1. FAZA SELEKCIJE: Koristimo blok koji vraća tuple (level, ids)
-        // Time izbjegavamo "value assigned but never read" warning
         let (target_level, candidate_ids) = {
             let manifest = self.manifest.lock().await;
             let active_files = manifest.get_active_files();
@@ -241,7 +239,6 @@ impl StorageEngine {
                     break;
                 }
             }
-            // Vraćamo rezultat iz bloka, ako je None, rano prekidamo funkciju
             match result {
                 Some(res) => res,
                 None => {
@@ -251,7 +248,6 @@ impl StorageEngine {
             }
         };
 
-        // 2. Dohvaćanje Readera na temelju ID-eva
         let candidates: Vec<Arc<SstReader>> = {
             let guard = self.sstables.read().await;
             guard
@@ -282,7 +278,6 @@ impl StorageEngine {
         let dir_clone = self.dir.clone();
         let candidate_paths: Vec<PathBuf> = candidates.iter().map(|c| c.path.clone()).collect();
 
-        // 3. FAZA IZVRŠENJA
         let new_sst_path = tokio::task::spawn_blocking(move || {
             Self::run_compaction_logic(candidate_paths, dir_clone)
         })
@@ -297,14 +292,12 @@ impl StorageEngine {
             .parse::<u128>()
             .unwrap();
 
-        // 4. AŽURIRANJE MANIFESTA
         {
             let mut manifest = self.manifest.lock().await;
             manifest.add_file(new_id, next_level).await?;
             manifest.remove_files(&candidate_ids).await?;
         }
 
-        // 5. AŽURIRANJE MEMORIJE
         {
             let mut guard = self.sstables.write().await;
             guard.retain(|sst| {
@@ -333,7 +326,6 @@ impl StorageEngine {
             });
         }
 
-        // 6. CLEANUP
         for reader in candidates {
             let _ = fs::remove_file(&reader.path).await;
         }

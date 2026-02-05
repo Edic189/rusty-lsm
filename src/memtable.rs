@@ -40,9 +40,6 @@ impl MemTable {
         Ok(())
     }
 
-    /// POPRAVAK OVDJE:
-    /// Uveli smo lifetime 'a.
-    /// Kažemo: self živi 'a, min/max reference žive 'a, i rezultat (Iterator) živi 'a.
     pub fn scan<'a>(
         &'a self,
         min: Bound<&'a [u8]>,

@@ -15,11 +15,9 @@ pub struct SstBuilder {
 }
 
 impl SstBuilder {
-    /// Veličina bloka (4 KB)
     const BLOCK_SIZE: usize = 4 * 1024;
 
     pub fn new(path: impl AsRef<Path>) -> Self {
-        // Procjena: 10k itema za Bloom (prilagodljivo)
         let bloom = Bloom::new_for_fp_rate(10_000, 0.01);
         Self {
             path: path.as_ref().to_path_buf(),
@@ -47,25 +45,21 @@ impl SstBuilder {
         for (key, value) in iter {
             self.bloom.set(&key);
 
-            // Procjena veličine entry-a (gruba)
             let entry_size = key.len() + value.as_ref().map(|v| v.len()).unwrap_or(0) + 8;
 
             let entry = SstEntry { key, value };
             self.current_block.push(entry);
             self.current_block_size += entry_size;
 
-            // Ako smo prešli limit bloka, ispiši ga na disk
             if self.current_block_size >= Self::BLOCK_SIZE {
                 self.flush_block(&mut writer, &mut file_offset).await?;
             }
         }
 
-        // Ispiši preostale podatke ako ih ima
         if !self.current_block.is_empty() {
             self.flush_block(&mut writer, &mut file_offset).await?;
         }
 
-        // --- Zapisivanje Meta Bloka (Index + Bloom) ---
         let bloom_bytes = serde_json::to_vec(&self.bloom)
             .map_err(|e| crate::error::LsmError::Serialization(e.to_string()))?;
 
@@ -77,14 +71,9 @@ impl SstBuilder {
         let meta_bytes = rkyv::to_bytes::<_, 4096>(&meta)
             .map_err(|e| crate::error::LsmError::Serialization(e.to_string()))?;
 
-        // Zapiši Meta blok
         let meta_offset = file_offset;
         writer.write_all(&meta_bytes).await?;
 
-        // --- Footer ---
-        // Na samom kraju datoteke zapisujemo 8 bajtova koji govore GDJE počinje Meta blok
-        // To nam omogućuje da prilikom otvaranja datoteke pročitamo samo zadnjih 8 bajtova
-        // i odmah znamo gdje su indexi.
         writer.write_u64(meta_offset).await?;
 
         writer.flush().await?;
@@ -104,24 +93,20 @@ impl SstBuilder {
 
         let first_key = self.current_block[0].key.clone();
 
-        // Serijaliziraj blok koristeći rkyv
         let block_bytes = rkyv::to_bytes::<_, 4096>(&self.current_block)
             .map_err(|e| crate::error::LsmError::Serialization(e.to_string()))?;
 
         let len = block_bytes.len() as u64;
 
-        // Zapiši u index gdje ovaj blok počinje
         self.block_index.push(BlockMeta {
             start_key: first_key,
             offset: *file_offset,
             len,
         });
 
-        // Zapiši na disk
         writer.write_all(&block_bytes).await?;
         *file_offset += len;
 
-        // Resetiraj buffer
         self.current_block.clear();
         self.current_block_size = 0;
 

@@ -7,8 +7,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileMetadata {
-    pub id: u128,   // Jedinstveni ID datoteke (timestamp)
-    pub level: u32, // Razina u LSM stablu (0, 1, 2...)
+    pub id: u128,
+    pub level: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -36,24 +36,20 @@ impl ManifestManager {
         Ok(Self { path, state })
     }
 
-    /// Dodaje novu SST tablicu u manifest
     pub async fn add_file(&mut self, id: u128, level: u32) -> Result<()> {
         self.state.files.insert(FileMetadata { id, level });
         self.flush().await
     }
 
-    /// Uklanja tablice iz manifesta (nakon kompakcije)
     pub async fn remove_files(&mut self, ids: &[u128]) -> Result<()> {
         self.state.files.retain(|f| !ids.contains(&f.id));
         self.flush().await
     }
 
-    // Atomski zapis na disk
     async fn flush(&self) -> Result<()> {
         let content = serde_json::to_vec_pretty(&self.state)
             .map_err(|e| crate::error::LsmError::Serialization(e.to_string()))?;
 
-        // Pišemo u privremenu datoteku pa preimenujemo (Atomic Save)
         let tmp_path = self.path.with_extension("tmp");
         let mut file = OpenOptions::new()
             .create(true)
@@ -65,14 +61,12 @@ impl ManifestManager {
         file.write_all(&content).await?;
         file.flush().await?;
 
-        // Atomski rename osigurava da manifest nikad nije korumpiran
         fs::rename(tmp_path, &self.path).await?;
         Ok(())
     }
 
     pub fn get_active_files(&self) -> Vec<FileMetadata> {
         let mut files: Vec<_> = self.state.files.iter().cloned().collect();
-        // Sortiramo po ID-u (vremenu) da imamo kronološki red
         files.sort_by_key(|f| f.id);
         files
     }
