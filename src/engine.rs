@@ -1,9 +1,10 @@
 use crate::error::Result;
 use crate::memtable::MemTable;
+use crate::merge::MergeIterator;
 use crate::sstable::{builder::SstBuilder, reader::SstReader};
 use crate::wal::Wal;
 use bytes::Bytes;
-use std::collections::BTreeMap; // Treba nam za sortiranje pri kompaktu
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
@@ -13,7 +14,8 @@ pub struct StorageEngine {
     dir: PathBuf,
     wal: Wal,
     memtable: RwLock<Arc<MemTable>>,
-    sstables: RwLock<Vec<SstReader>>,
+    // Sstables su sada Arc kako bi ih lako klonirali za čitanje
+    sstables: RwLock<Vec<Arc<SstReader>>>,
 }
 
 impl StorageEngine {
@@ -25,8 +27,8 @@ impl StorageEngine {
         let wal = Wal::new(&wal_path).await?;
 
         let memtable = MemTable::new();
+        // Replay WAL
         let recovered_data = wal.replay().await?;
-
         for (key, value) in recovered_data {
             if let Some(val) = value {
                 memtable.put(key, val)?;
@@ -35,10 +37,7 @@ impl StorageEngine {
             }
         }
 
-        if !memtable.is_empty() {
-            tracing::info!("Recovered {} records from WAL", memtable.approximate_size());
-        }
-
+        // Učitaj SST datoteke
         let mut sstables = Vec::new();
         let mut read_dir = fs::read_dir(&dir).await?;
         let mut paths = Vec::new();
@@ -49,12 +48,11 @@ impl StorageEngine {
                 paths.push(path);
             }
         }
-
-        paths.sort();
+        paths.sort(); // Bitno: starije datoteke prve
 
         for path in paths {
             let reader = SstReader::open(&path)?;
-            sstables.push(reader);
+            sstables.push(Arc::new(reader));
         }
 
         Ok(Self {
@@ -68,34 +66,32 @@ impl StorageEngine {
     pub async fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Result<()> {
         let key = key.into();
         let value = value.into();
-
         self.wal.append(&key, Some(&value)).await?;
         let mem = self.memtable.read().await;
         mem.put(key, value)?;
-
         Ok(())
     }
 
     pub async fn delete(&self, key: impl Into<Bytes>) -> Result<()> {
         let key = key.into();
-
         self.wal.append(&key, None).await?;
         let mem = self.memtable.read().await;
         mem.delete(key)?;
-
         Ok(())
     }
 
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        // 1. Check Memtable
         {
             let mem = self.memtable.read().await;
             match mem.get(key) {
                 Some(Some(val)) => return Ok(Some(val.to_vec())),
-                Some(None) => return Ok(None),
+                Some(None) => return Ok(None), // Tombstone
                 None => {}
             }
         }
 
+        // 2. Check SSTables (od najnovije prema najstarijoj)
         let sstables = self.sstables.read().await;
         for sst in sstables.iter().rev() {
             if let Some(val) = sst.get(key)? {
@@ -108,7 +104,6 @@ impl StorageEngine {
 
     pub async fn flush(&self) -> Result<()> {
         let old_memtable;
-
         {
             let mut guard = self.memtable.write().await;
             old_memtable = guard.clone();
@@ -131,83 +126,124 @@ impl StorageEngine {
         let reader = SstReader::open(&sst_path)?;
         {
             let mut sst_guard = self.sstables.write().await;
-            sst_guard.push(reader);
+            sst_guard.push(Arc::new(reader));
         }
 
         self.wal.reset().await?;
-
         tracing::info!("Flushed MemTable to {:?}", sst_path);
-
         Ok(())
     }
 
-    /// NOVO: Kompaktiranje
-    /// Spaja sve SST datoteke u jednu, uklanja duplikate i obrisane podatke.
+    /// --- BACKGROUND COMPACTION ---
+    /// Ovo je ključna promjena. Ne blokiramo `write` lock cijelo vrijeme.
     pub async fn compact(&self) -> Result<()> {
-        // 1. Uzimamo WRITE lock jer ćemo mijenjati strukturu sstables
-        let mut sstables_guard = self.sstables.write().await;
-
-        if sstables_guard.is_empty() {
-            return Ok(());
-        }
-
-        tracing::info!("Starting compaction of {} tables...", sstables_guard.len());
-
-        // 2. Mapiranje u memoriji (Sorted Map)
-        // BTreeMap automatski sortira po ključu.
-        // Ključ je Vec<u8>, Vrijednost je Option<Vec<u8>> (None znači tombstone)
-        let mut map: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-
-        // 3. Iteriramo od NAJSTARIJE prema NAJNOVIJOJ tablici.
-        // To osigurava da noviji podaci (čak i tombstones) pregaze stare.
-        for sst in sstables_guard.iter() {
-            for (key, value) in sst.iter() {
-                map.insert(key.to_vec(), value.map(|v| v.to_vec()));
+        // 1. Identificiraj kandidate (Snapshot faza)
+        let candidates: Vec<PathBuf>;
+        {
+            let guard = self.sstables.read().await;
+            if guard.len() <= 1 {
+                return Ok(());
             }
+            candidates = guard.iter().map(|r| r.path.clone()).collect();
         }
 
-        // 4. Izradi novu SST datoteku
+        tracing::info!(
+            "Starting background compaction of {} files...",
+            candidates.len()
+        );
+
+        let dir_clone = self.dir.clone();
+
+        // POPRAVAK 1: Kloniramo kandidate POSEBNO za thread.
+        // Original varijablu `candidates` čuvamo za cleanup fazu dolje.
+        let candidates_for_thread = candidates.clone();
+
+        // 2. Izvrši spajanje u zasebnom threadu
+        let new_sst_path = tokio::task::spawn_blocking(move || {
+            Self::run_compaction_logic(candidates_for_thread, dir_clone)
+        })
+        .await
+        .map_err(|e| crate::error::LsmError::Serialization(e.to_string()))??;
+
+        // 3. Zamjena (Critical Section)
+        {
+            let mut guard = self.sstables.write().await;
+
+            // Koristimo 'candidates' (original) da znamo što micati
+            let compacted_files_set: HashSet<PathBuf> = candidates.iter().cloned().collect();
+
+            let mut remaining_sstables: Vec<Arc<SstReader>> = guard
+                .drain(..)
+                .filter(|sst| !compacted_files_set.contains(&sst.path))
+                .collect();
+
+            let new_reader = SstReader::open(&new_sst_path)?;
+
+            let mut new_list = vec![Arc::new(new_reader)];
+            new_list.append(&mut remaining_sstables);
+
+            *guard = new_list;
+        }
+
+        // 4. Cleanup
+        // Ovdje sada sigurno koristimo 'candidates' jer ga nismo poslali u thread
+        for path in candidates {
+            let _ = fs::remove_file(path).await;
+        }
+
+        tracing::info!("Compaction complete. New SST: {:?}", new_sst_path);
+        Ok(())
+    }
+
+    fn run_compaction_logic(files: Vec<PathBuf>, dir: PathBuf) -> Result<PathBuf> {
+        // 1. Otvori sve SstReadere odjednom
+        let mut readers = Vec::new();
+        for path in &files {
+            let reader = SstReader::open(path)?;
+            readers.push(reader);
+        }
+
+        // 2. Kreiraj iteratore za svaki reader
+        // Moramo pretvoriti reference iz readera u (Vec<u8>, Option<Vec<u8>>)
+        // jer MergeIterator treba 'owned' podatke za Heap.
+        // Iako kopiramo ključeve, ovo je streaming, pa u memoriji držimo
+        // samo po jedan ključ iz svake datoteke, a ne sve!
+        let mut iterators = Vec::new();
+        for reader in &readers {
+            let iter = reader
+                .iter()
+                .map(|(k, v)| (k.to_vec(), v.map(|x| x.to_vec())));
+            // Box-amo iteratore da riješimo tipove, jer svaki iter ima drugačiji lifetime
+            // vezan za reader u vektoru. Ali ovdje su svi isti tip.
+            // Jednostavnosti radi, collectamo ih u Vec<Box<dyn Iterator...>> ili koristimo isti tip.
+            // Srećom, ovdje su svi isti tip (Map iterator), pa ne trebamo Box.
+            iterators.push(iter);
+        }
+
+        // 3. Kreiraj MergeIterator
+        let merge_iter = MergeIterator::new(iterators);
+
         let id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_micros();
-        let new_sst_path = self.dir.join(format!("{}_compacted.sst", id));
+        let new_path = dir.join(format!("{}_compacted.sst", id));
 
-        // Moramo ručno napraviti MemTable ili adaptirati Builder.
-        // Ovdje ćemo koristiti trik: Napraviti privremeni MemTable da iskoristimo postojeći Builder logic.
-        // (U optimiziranoj verziji Builder bi primao Iterator, ali ovo je lakše za MVP)
-        let temp_memtable = MemTable::new();
-        for (key, value) in map {
-            if let Some(val) = value {
-                let _ = temp_memtable.put(Bytes::from(key), Bytes::from(val));
-            } else {
-                // Ako je zadnje stanje Tombstone, u Full Compaction ga možemo čak i izbaciti
-                // ako smo sigurni da nema starijih snapshotova koji se koriste.
-                // Za sigurnost, zadržimo ga kao delete marker.
-                let _ = temp_memtable.delete(Bytes::from(key));
-            }
-        }
+        let builder = SstBuilder::new(&new_path);
 
-        let builder = SstBuilder::new(&new_sst_path);
-        builder.build_from_memtable(&temp_memtable).await?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-        // 5. Otvori novu datoteku
-        let new_reader = SstReader::open(&new_sst_path)?;
+        // 4. Izgradi novu tablicu koristeći streaming iterator
+        // Napomena: approx_items ovdje ne možemo znati točno unaprijed bez prolaska,
+        // pa ćemo staviti 0 ili neku heuristiku. SstBuilder će raditi resize Blooma ili
+        // možemo zbrojiti veličine datoteka za procjenu.
+        let approx_items = 1000; // Ili zbroji .len() iz metadataka readera ako ih imaš
 
-        // 6. Zamijeni listu sstables sa novom listom koja ima samo ovu jednu datoteku
-        // Prvo skupimo putanje starih datoteka da ih možemo obrisati
-        let old_files: Vec<PathBuf> = sstables_guard.iter().map(|r| r.path.clone()).collect();
+        rt.block_on(async { builder.build(merge_iter, approx_items).await })?;
 
-        // Postavi novu listu
-        *sstables_guard = vec![new_reader];
-
-        // 7. Obriši stare datoteke s diska
-        for path in old_files {
-            let _ = tokio::fs::remove_file(path).await;
-        }
-
-        tracing::info!("Compaction complete. New SST: {:?}", new_sst_path);
-
-        Ok(())
+        Ok(new_path)
     }
 }

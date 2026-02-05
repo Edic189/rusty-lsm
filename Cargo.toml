@@ -6,6 +6,11 @@ edition = "2021" # 2024 isn't fully stable in all channels yet, but we will writ
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
 
+bloomfilter = { version = "1.0.9", features = ["serde"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
 crossbeam-skiplist = "0.1"
 crossbeam-utils = "0.8"
 parking_lot = "0.12"
