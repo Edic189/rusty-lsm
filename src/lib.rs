@@ -2,7 +2,7 @@
 pub mod engine;
 pub mod error;
 pub mod memtable;
-pub mod sstable; // This looks for src/sstable/mod.rs
+pub mod sstable;
 pub mod wal;
 
 pub use error::{LsmError, Result};

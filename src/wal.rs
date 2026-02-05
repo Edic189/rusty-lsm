@@ -57,7 +57,6 @@ impl Wal {
         writer.write_u32(checksum).await?;
         writer.write_all(&buf).await?;
 
-        // Durability: Ensure data hits the disk
         writer.flush().await?;
         writer.get_ref().sync_all().await?;
 

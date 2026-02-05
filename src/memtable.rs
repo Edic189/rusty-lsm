@@ -47,7 +47,6 @@ impl MemTable {
         self.map.is_empty()
     }
 
-    // Fixed warning: Added `'_` to Entry
     pub fn iter(
         &self,
     ) -> impl Iterator<Item = crossbeam_skiplist::map::Entry<'_, Bytes, EntryValue>> {

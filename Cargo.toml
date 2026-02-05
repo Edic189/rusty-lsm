@@ -4,29 +4,21 @@ version = "0.1.0"
 edition = "2021" # 2024 isn't fully stable in all channels yet, but we will write forward-compatible code.
 
 [dependencies]
-# Async Runtime
 tokio = { version = "1.36", features = ["full"] }
 
-# Data Structures & Concurrency
 crossbeam-skiplist = "0.1"
 crossbeam-utils = "0.8"
-parking_lot = "0.12" # Optimized locks for lower-level components
-bytes = "1.5" # Efficient byte buffer management
-
-# Serialization (Zero-Copy)
+parking_lot = "0.12"
+bytes = "1.5"
 rkyv = { version = "0.7", features = ["validation"] }
 
-# Error Handling
 thiserror = "1.0"
 anyhow = "1.0"
-
-# Observability
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
-# File I/O & System
-crc32fast = "1.3" # Data integrity checks
-memmap2 = "0.9"   # For zero-copy reading of SSTables
+crc32fast = "1.3"
+memmap2 = "0.9"
 
 [dev-dependencies]
 tempfile = "3.10"
