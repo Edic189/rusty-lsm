@@ -5,6 +5,7 @@ use crate::sstable::{builder::SstBuilder, reader::SstReader};
 use crate::wal::Wal;
 use bytes::Bytes;
 use std::collections::HashSet;
+use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
@@ -14,7 +15,6 @@ pub struct StorageEngine {
     dir: PathBuf,
     wal: Wal,
     memtable: RwLock<Arc<MemTable>>,
-    // Sstables su sada Arc kako bi ih lako klonirali za čitanje
     sstables: RwLock<Vec<Arc<SstReader>>>,
 }
 
@@ -37,7 +37,6 @@ impl StorageEngine {
             }
         }
 
-        // Učitaj SST datoteke
         let mut sstables = Vec::new();
         let mut read_dir = fs::read_dir(&dir).await?;
         let mut paths = Vec::new();
@@ -48,7 +47,7 @@ impl StorageEngine {
                 paths.push(path);
             }
         }
-        paths.sort(); // Bitno: starije datoteke prve
+        paths.sort();
 
         for path in paths {
             let reader = SstReader::open(&path)?;
@@ -81,17 +80,15 @@ impl StorageEngine {
     }
 
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // 1. Check Memtable
         {
             let mem = self.memtable.read().await;
             match mem.get(key) {
                 Some(Some(val)) => return Ok(Some(val.to_vec())),
-                Some(None) => return Ok(None), // Tombstone
+                Some(None) => return Ok(None),
                 None => {}
             }
         }
 
-        // 2. Check SSTables (od najnovije prema najstarijoj)
         let sstables = self.sstables.read().await;
         for sst in sstables.iter().rev() {
             if let Some(val) = sst.get(key)? {
@@ -100,6 +97,80 @@ impl StorageEngine {
         }
 
         Ok(None)
+    }
+
+    /// SCAN: Vraća iterator sortiranih ključeva i vrijednosti u zadanom rasponu.
+    /// Range argumenti: .. (sve), "a".."b" (od a do b), "a".. (od a do kraja)
+    pub async fn scan(
+        &self,
+        range: impl std::ops::RangeBounds<Vec<u8>>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let start_bound = range.start_bound();
+        let end_bound = range.end_bound();
+
+        // Konverzija Bound<&Vec<u8>> u Bound<&[u8]> za SST/Memtable pozive
+        let start_slice = match start_bound {
+            Bound::Included(v) => Bound::Included(v.as_slice()),
+            Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+
+        let end_slice = match end_bound {
+            Bound::Included(v) => Bound::Included(v.as_slice()),
+            Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+
+        // 1. MemTable Iterator
+        let mem_guard = self.memtable.read().await;
+        let mem_iter = mem_guard
+            .scan(start_slice, end_slice)
+            .map(|(k, v)| (k.to_vec(), v.map(|val| val.to_vec())));
+
+        // 2. SSTable Iterators
+        let sst_guard = self.sstables.read().await;
+        let mut iterators = Vec::new();
+
+        // MemTable je uvijek najnoviji (index 0 u MergeIteratoru), pa ga dodajemo zadnjeg u listu
+        // jer MergeIterator radi s heapom. Zapravo, MergeIterator uzima Vec iteratora.
+        // Redoslijed u vectoru je bitan za deduplikaciju: iterator s VEĆIM indeksom u vectoru je "noviji".
+        // Dakle, stare SST tablice idu na početak, a MemTable na kraj.
+
+        for sst in sst_guard.iter() {
+            let iter = sst
+                .scan(start_slice)
+                .map(|(k, v)| (k.to_vec(), v.map(|x| x.to_vec())));
+            // Moramo "zapakirati" iteratore da budu istog tipa (Box<dyn...>)
+            iterators.push(Box::new(iter) as Box<dyn Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>>);
+        }
+
+        // Dodaj MemTable iterator kao zadnji (najnoviji podaci)
+        iterators.push(Box::new(mem_iter));
+
+        let merge_iter = MergeIterator::new(iterators);
+
+        // 3. Filtriranje i limitiranje
+        let mut results = Vec::new();
+
+        for (key, value) in merge_iter {
+            // Provjera gornje granice (End Bound)
+            let is_past_end = match end_slice {
+                Bound::Included(end) => key.as_slice() > end,
+                Bound::Excluded(end) => key.as_slice() >= end,
+                Bound::Unbounded => false,
+            };
+
+            if is_past_end {
+                break;
+            }
+
+            // Ako je value Some, to je važeći podatak. Ako je None, to je tombstone (obrisano).
+            if let Some(val) = value {
+                results.push((key, val));
+            }
+        }
+
+        Ok(results)
     }
 
     pub async fn flush(&self) -> Result<()> {
@@ -134,10 +205,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// --- BACKGROUND COMPACTION ---
-    /// Ovo je ključna promjena. Ne blokiramo `write` lock cijelo vrijeme.
     pub async fn compact(&self) -> Result<()> {
-        // 1. Identificiraj kandidate (Snapshot faza)
         let candidates: Vec<PathBuf>;
         {
             let guard = self.sstables.read().await;
@@ -153,23 +221,16 @@ impl StorageEngine {
         );
 
         let dir_clone = self.dir.clone();
-
-        // POPRAVAK 1: Kloniramo kandidate POSEBNO za thread.
-        // Original varijablu `candidates` čuvamo za cleanup fazu dolje.
         let candidates_for_thread = candidates.clone();
 
-        // 2. Izvrši spajanje u zasebnom threadu
         let new_sst_path = tokio::task::spawn_blocking(move || {
             Self::run_compaction_logic(candidates_for_thread, dir_clone)
         })
         .await
         .map_err(|e| crate::error::LsmError::Serialization(e.to_string()))??;
 
-        // 3. Zamjena (Critical Section)
         {
             let mut guard = self.sstables.write().await;
-
-            // Koristimo 'candidates' (original) da znamo što micati
             let compacted_files_set: HashSet<PathBuf> = candidates.iter().cloned().collect();
 
             let mut remaining_sstables: Vec<Arc<SstReader>> = guard
@@ -185,8 +246,6 @@ impl StorageEngine {
             *guard = new_list;
         }
 
-        // 4. Cleanup
-        // Ovdje sada sigurno koristimo 'candidates' jer ga nismo poslali u thread
         for path in candidates {
             let _ = fs::remove_file(path).await;
         }
@@ -196,31 +255,22 @@ impl StorageEngine {
     }
 
     fn run_compaction_logic(files: Vec<PathBuf>, dir: PathBuf) -> Result<PathBuf> {
-        // 1. Otvori sve SstReadere odjednom
         let mut readers = Vec::new();
         for path in &files {
             let reader = SstReader::open(path)?;
             readers.push(reader);
         }
 
-        // 2. Kreiraj iteratore za svaki reader
-        // Moramo pretvoriti reference iz readera u (Vec<u8>, Option<Vec<u8>>)
-        // jer MergeIterator treba 'owned' podatke za Heap.
-        // Iako kopiramo ključeve, ovo je streaming, pa u memoriji držimo
-        // samo po jedan ključ iz svake datoteke, a ne sve!
         let mut iterators = Vec::new();
         for reader in &readers {
             let iter = reader
                 .iter()
                 .map(|(k, v)| (k.to_vec(), v.map(|x| x.to_vec())));
-            // Box-amo iteratore da riješimo tipove, jer svaki iter ima drugačiji lifetime
-            // vezan za reader u vektoru. Ali ovdje su svi isti tip.
-            // Jednostavnosti radi, collectamo ih u Vec<Box<dyn Iterator...>> ili koristimo isti tip.
-            // Srećom, ovdje su svi isti tip (Map iterator), pa ne trebamo Box.
-            iterators.push(iter);
+
+            // Box-amo iteratore da budu isti tip
+            iterators.push(Box::new(iter) as Box<dyn Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>>);
         }
 
-        // 3. Kreiraj MergeIterator
         let merge_iter = MergeIterator::new(iterators);
 
         let id = std::time::SystemTime::now()
@@ -236,11 +286,7 @@ impl StorageEngine {
             .build()
             .unwrap();
 
-        // 4. Izgradi novu tablicu koristeći streaming iterator
-        // Napomena: approx_items ovdje ne možemo znati točno unaprijed bez prolaska,
-        // pa ćemo staviti 0 ili neku heuristiku. SstBuilder će raditi resize Blooma ili
-        // možemo zbrojiti veličine datoteka za procjenu.
-        let approx_items = 1000; // Ili zbroji .len() iz metadataka readera ako ih imaš
+        let approx_items = 1000;
 
         rt.block_on(async { builder.build(merge_iter, approx_items).await })?;
 

@@ -4,6 +4,7 @@ use bloomfilter::Bloom;
 use memmap2::MmapOptions;
 use rkyv::check_archived_root;
 use std::fs::File;
+use std::ops::Bound;
 use std::path::Path;
 
 pub struct SstReader {
@@ -56,8 +57,36 @@ impl SstReader {
 
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], Option<&[u8]>)> {
         let archived_root = unsafe { rkyv::archived_root::<SstFileData>(&self.mmap[..]) };
-
         archived_root.entries.iter().map(|entry| {
+            let key = entry.key.as_slice();
+            let val = match &entry.value {
+                rkyv::option::ArchivedOption::Some(v) => Some(v.as_slice()),
+                rkyv::option::ArchivedOption::None => None,
+            };
+            (key, val)
+        })
+    }
+
+    /// Vraća iterator koji počinje od prvog ključa >= start_key
+    /// Ograničavanje gornje granice (end_key) ostavljamo pozivatelju (MergeIteratoru ili Engineu)
+    pub fn scan(&self, start: Bound<&[u8]>) -> impl Iterator<Item = (&[u8], Option<&[u8]>)> {
+        let archived_root = unsafe { rkyv::archived_root::<SstFileData>(&self.mmap[..]) };
+        let entries = &archived_root.entries;
+
+        // Pronađi indeks gdje početi
+        let start_index = match start {
+            Bound::Included(key) => entries
+                .binary_search_by(|e| e.key.as_slice().cmp(key))
+                .unwrap_or_else(|idx| idx),
+            Bound::Excluded(key) => entries
+                .binary_search_by(|e| e.key.as_slice().cmp(key))
+                .map(|idx| idx + 1)
+                .unwrap_or_else(|idx| idx),
+            Bound::Unbounded => 0,
+        };
+
+        // Vrati iterator od tog indeksa nadalje
+        entries[start_index..].iter().map(|entry| {
             let key = entry.key.as_slice();
             let val = match &entry.value {
                 rkyv::option::ArchivedOption::Some(v) => Some(v.as_slice()),

@@ -1,6 +1,7 @@
 use crate::error::LsmError;
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 type MemResult<T> = std::result::Result<T, LsmError>;
@@ -27,13 +28,8 @@ impl MemTable {
         Ok(())
     }
 
-    /// Vraća:
-    /// - None: Ključ ne postoji u ovoj tablici.
-    /// - Some(None): Ključ postoji, ali je označen za brisanje (Tombstone).
-    /// - Some(Some(val)): Ključ postoji i ima vrijednost.
     pub fn get(&self, key: &[u8]) -> Option<Option<Bytes>> {
         let entry = self.map.get(key)?;
-        // Vraćamo kopiju Option<Bytes> unutar Entry-a
         Some(entry.value().clone())
     }
 
@@ -42,6 +38,19 @@ impl MemTable {
         self.map.insert(key, None);
         self.size.fetch_add(size_diff, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// POPRAVAK OVDJE:
+    /// Uveli smo lifetime 'a.
+    /// Kažemo: self živi 'a, min/max reference žive 'a, i rezultat (Iterator) živi 'a.
+    pub fn scan<'a>(
+        &'a self,
+        min: Bound<&'a [u8]>,
+        max: Bound<&'a [u8]>,
+    ) -> impl Iterator<Item = (Bytes, EntryValue)> + 'a {
+        self.map
+            .range::<[u8], _>((min, max))
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
     }
 
     pub fn approximate_size(&self) -> usize {
