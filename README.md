@@ -1,107 +1,139 @@
-# Rusty LSM: Persistent Key-Value Storage Engine
+# Rusty LSM: High-Performance Async Key-Value Store
 
-Rusty LSM is a high-performance, persistent key-value storage engine implemented in Rust. It utilizes a Log-Structured Merge-Tree (LSM-Tree) architecture, designed for high write throughput and efficient querying. The engine supports atomic persistence, crash recovery, and tiered storage management.
+Rusty LSM is a production-grade, persistent Log-Structured Merge-Tree (LSM) storage engine written in Rust. It is built for high-throughput write operations and low-latency reads, leveraging asynchronous I/O via Tokio and modern storage techniques including memory mapping, zero-copy deserialization, and block compression.
 
 ## Key Features
 
-* **LSM-Tree Architecture:** Optimized for sequential write performance and minimized disk I/O.
-* **Crash Recovery:** Implements a Write-Ahead Log (WAL) to ensure data durability and system state restoration after a failure.
-* **In-Memory Storage:** Uses a concurrent, lock-free SkipList (via `crossbeam-skiplist`) for high-performance memory operations.
-* **Block-Based SSTables:** Disk storage is organized into 4KB blocks with sparse indexing, minimizing memory overhead and optimizing block-level access.
-* **Leveled Compaction:** Advanced background compaction strategy (L0 -> L1 -> L2...) to manage write amplification and optimize read performance.
-* **Manifest Management:** Atomic state tracking via `manifest.json` ensures database consistency across restarts and compaction cycles.
-* **Zero-Copy Serialization:** Implements `rkyv` for efficient, zero-copy data access directly from memory-mapped files.
-* **Range Scans:** Supports efficient iteration over keys within a specified range.
-* **Asynchronous I/O:** Built on the `tokio` runtime for non-blocking operations and high concurrency.
+* **LSM-Tree Architecture:** Optimized for sequential writes and high ingestion rates.
+* **Data Durability:** Write-Ahead Log (WAL) with CRC32 checksums ensures zero data loss on crashes.
+* **Atomic Transactions:** Support for Atomic Write Batches (Put/Delete multiple keys in a single transaction).
+* **High-Performance Reads:**
+    * **Memory Mapping (mmap):** Bypasses syscall overhead for file I/O.
+    * **Block Cache (LRU):** Caches frequently accessed uncompressed data blocks in RAM.
+    * **Bloom Filters:** Probabilistic filtering to avoid unnecessary disk seeks.
+    * **Range Filtering:** Checks min/max key metadata before opening blocks.
+* **Storage Efficiency:**
+    * **Snappy Compression:** Blocks are compressed on disk using the Google Snappy algorithm.
+    * **Prefix Compression:** Reduces space usage by storing only key differences for sorted data.
+    * **Tombstone Garbage Collection:** Removes deleted keys during compaction at the bottom level.
+* **Zero-Copy Access:** Uses `rkyv` for deserializing data directly from memory maps without allocations.
+* **Streaming Iterators:** Memory-safe scan operations that yield items lazily, preventing OOM errors on large range scans.
 
 ## Architecture
 
 ### Write Path
-1.  **WAL Append:** Every write operation (`put`, `delete`) is first appended to the Write-Ahead Log on disk for durability.
-2.  **MemTable Insert:** Data is then inserted into the in-memory SkipList.
-3.  **Flush:** When a threshold is met, the MemTable is flushed to disk as a Sorted String Table (SST) at Level 0, and the WAL is reset.
+1. **WAL Append:** Operations are serialized into a batch, checksummed (CRC32), and appended to the disk log.
+2. **MemTable Insert:** Data is applied to the concurrent in-memory SkipList.
+3. **Flush:** When MemTable size exceeds the limit, it is flushed to L0 SSTable using Prefix Encoding and Snappy Compression.
 
 ### Read Path
-1.  **MemTable Lookup:** The engine first checks the active in-memory buffer.
-2.  **SSTable Lookup:** If not found, the engine queries SSTables starting from Level 0 down through the hierarchy.
-3.  **Optimizations:**
-    * **Bloom Filters:** Probabilistic data structures used to skip files that do not contain the target key.
-    * **Sparse Index:** Locates the specific 4KB data block containing the key to minimize disk reads.
+1. **MemTable:** Checks active memory buffer.
+2. **Block Cache:** Checks the in-memory LRU cache for the requested block.
+3. **SSTable Lookup:**
+    * **Bloom Filter & Range Check:** Fast rejection if key is not present.
+    * **Sparse Index:** Binary search to locate the 4KB data block.
+    * **Fetch & Verify:** Reads from disk/mmap, verifies CRC32, decompresses, and populates Cache.
 
 ### Compaction Strategy
-The engine implements a tiered/leveled compaction algorithm to manage disk space and read latency:
-* **Level 0 (L0):** Buffer for flushed MemTables. Threshold: 2 files.
-* **Level N (L1+):** Deeper storage levels with higher capacities. Threshold: 4 files.
-* **Process:** When a level exceeds its threshold, all files in that level are merge-sorted into a single SSTable at the next level (`Level + 1`), removing overwritten keys and tombstones.
+* **Leveled Compaction:** Moves data through levels (L0 -> L1 -> ... -> L7).
+* **Merge Sort:** Merges overlapping files using a k-way merge iterator.
+* **GC:** Tombstones (deletes) are physically removed when data reaches the bottom level.
 
 ## Storage Format
 
-### SSTable Structure (`.sst`)
-SSTables are immutable and optimized for memory mapping (`mmap`):
-* **Data Blocks:** 4KB chunks containing sorted key-value pairs.
-* **Meta Block:** Contains the Block Index (first keys and offsets) and Bloom Filter.
-* **Footer:** Fixed-size 8-byte trailer containing the offset of the Meta Block.
+### SSTable (.sst)
+Files are immutable and organized into 4KB blocks:
+* **Data Block:** [Overlap | DiffKey | Value] entries -> Compressed (Snappy) -> Checksummed (CRC32).
+* **Meta Block:** Sparse Index, Bloom Filter, Min/Max Keys.
+* **Footer:** Offset pointer to the Meta Block.
 
-### Manifest (`manifest.json`)
-The Manifest tracks the active file set and their hierarchy levels.
-
-```json
-{
-  "files": [
-    {
-      "id": 1770295102,
-      "level": 1
-    },
-    {
-      "id": 1770295146,
-      "level": 2
-    }
-  ]
-}
-```
+### Manifest (manifest.json)
+Atomic state management tracking active files and levels, ensuring consistency across restarts.
 
 ## Setup and Usage
 
-### Prerequisites
-* Rust (latest stable toolchain)
+### Library Usage
+Add `rusty-lsm` to your project dependencies.
 
-### Build and Run
+```rust
+use rusty_lsm::engine::StorageEngine;
+use rusty_lsm::batch::WriteBatch;
 
-```bash
-# Build release version
-cargo build --release
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize engine
+    let engine = StorageEngine::new("./db_data").await?;
 
-# Run the CLI
-cargo run
+    // 1. Simple Put/Get
+    engine.put("user:1", "Alice").await?;
+    
+    if let Some(val) = engine.get(b"user:1").await? {
+        println!("Found: {}", String::from_utf8_lossy(&val));
+    }
+
+    // 2. Atomic Batch Write
+    let mut batch = WriteBatch::new();
+    batch.put(b"user:2", b"Bob");
+    batch.put(b"user:3", b"Charlie");
+    batch.delete(b"user:1"); // Delete Alice
+    engine.write(batch).await?;
+
+    // 3. Range Scan (Streaming)
+    // .to_vec() is required because scan expects Vec bounds
+    let iter = engine.scan(b"user:0".to_vec()..b"user:9".to_vec()).await?;
+    for (key, val) in iter {
+        println!(
+            "{} => {}", 
+            String::from_utf8_lossy(&key), 
+            String::from_utf8_lossy(&val)
+        );
+    }
+
+    // 4. Manual Maintenance (Optional)
+    engine.flush().await?;   // Force MemTable to Disk
+    engine.compact().await?; // Trigger Compaction/GC
+
+    Ok(())
+}
 ```
 
-### CLI Commands
+### CLI Tool
+You can run the engine as a standalone CLI.
+
+```bash
+cargo run --release --bin rusty-lsm
+```
 
 | Command | Usage | Description |
 | :--- | :--- | :--- |
-| `put` | `put [key] [value]` | Insert or update a key-value pair. |
-| `get` | `get [key]` | Retrieve the value for a specific key. |
-| `delete` | `delete [key]` | Mark a key for deletion (writes a tombstone). |
-| `scan` | `scan [start] [end]` | Iterate over keys in the range `[start, end)`. |
-| `flush` | `flush` | Manually persist the current MemTable to Level 0. |
-| `compact` | `compact` | Manually trigger the leveled compaction process. |
-| `exit` | `exit` | Gracefully shutdown the engine. |
+| `put` | `put [k] [v]` | Insert key-value. |
+| `get` | `get [k]` | Retrieve value. |
+| `delete` | `delete [k]` | Delete key. |
+| `scan` | `scan [start] [end]` | Range scan (inclusive start, exclusive end). |
+| `flush` | `flush` | Persist memory to disk. |
+| `compact` | `compact` | Merge files and clean up deleted keys. |
 
 ## Project Structure
 
-* `src/engine.rs`: Core engine implementation (Put, Get, Scan, Flush, Compact).
-* `src/memtable.rs`: Concurrent in-memory SkipList implementation.
-* `src/sstable/builder.rs`: Logic for constructing block-based SST files.
-* `src/sstable/reader.rs`: Memory-mapped reading and indexing logic.
-* `src/manifest.rs`: Atomic database state management.
-* `src/wal.rs`: Write-Ahead Log for crash resilience.
-* `src/merge.rs`: K-way merge sorting for compaction and scanning.
+* `src/engine.rs`: Orchestrator (Put, Get, Scan, Compact).
+* `src/sstable/`: Disk format, Builder (Compression/Prefix), Reader (mmap/access).
+* `src/wal.rs`: Crash recovery log with Batch support.
+* `src/memtable.rs`: Lock-free SkipList wrapper.
+* `src/cache.rs`: Thread-safe LRU Block Cache.
+* `src/batch.rs`: Atomic write batch definition.
+* `src/iterator.rs`: Merging iterator for Scan operations.
+* `src/manifest.rs`: Metadata and level management.
 
 ## Dependencies
 
-* `tokio`: Asynchronous runtime for I/O and task scheduling.
-* `crossbeam-skiplist`: High-performance concurrent SkipList.
-* `memmap2`: Efficient memory mapping for file access.
-* `rkyv`: Zero-copy serialization framework.
-* `bloomfilter`: Read-path optimization structure.
-* `serde_json`: Manifest serialization and deserialization.
+* `tokio`
+* `memmap2`
+* `bytes`
+* `lru`
+* `rkyv`
+* `serde`
+* `bincode`
+* `snap`
+* `crc32fast`
+* `bloomfilter`
+* `crossbeam-skiplist`
