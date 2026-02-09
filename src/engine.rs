@@ -1,5 +1,6 @@
 use crate::batch::{BatchOp, WriteBatch};
 use crate::cache::BlockCache;
+use crate::config::LsmConfig;
 use crate::error::Result;
 use crate::iterator::StorageIterator;
 use crate::manifest::ManifestManager;
@@ -15,6 +16,7 @@ use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
 
 pub struct StorageEngine {
+    pub config: LsmConfig,
     dir: PathBuf,
     wal: Wal,
     memtable: RwLock<Arc<MemTable>>,
@@ -23,14 +25,9 @@ pub struct StorageEngine {
     block_cache: Arc<BlockCache>,
 }
 
-const MAX_LEVELS: u32 = 7;
-const L0_THRESHOLD: usize = 2;
-const LN_THRESHOLD: usize = 4;
-const CACHE_CAPACITY: usize = 1000;
-
 impl StorageEngine {
-    pub async fn new(dir: impl Into<PathBuf>) -> Result<Self> {
-        let dir = dir.into();
+    pub async fn new(config: LsmConfig) -> Result<Self> {
+        let dir = config.dir.clone();
         fs::create_dir_all(&dir).await?;
 
         let wal_path = dir.join("wal.log");
@@ -41,6 +38,11 @@ impl StorageEngine {
 
         let memtable = MemTable::new();
         let recovered_data = wal.replay().await?;
+
+        if !recovered_data.is_empty() {
+            tracing::info!("Recovered {} records from WAL", recovered_data.len());
+        }
+
         for (key, value) in recovered_data {
             if let Some(val) = value {
                 memtable.put(key, val)?;
@@ -49,7 +51,7 @@ impl StorageEngine {
             }
         }
 
-        let block_cache = Arc::new(BlockCache::new(CACHE_CAPACITY));
+        let block_cache = Arc::new(BlockCache::new(config.block_cache_capacity));
 
         let mut sstables = Vec::new();
         for meta in active_files {
@@ -63,6 +65,7 @@ impl StorageEngine {
         sstables.sort_by_key(|r| r.id);
 
         Ok(Self {
+            config,
             dir,
             wal,
             memtable: RwLock::new(Arc::new(memtable)),
@@ -73,6 +76,16 @@ impl StorageEngine {
     }
 
     pub async fn write(&self, batch: WriteBatch) -> Result<()> {
+        let should_flush = {
+            let mem = self.memtable.read().await;
+            mem.approximate_size() > self.config.memtable_capacity
+        };
+
+        if should_flush {
+            tracing::info!("MemTable capacity reached. Triggering flush.");
+            self.flush().await?;
+        }
+
         self.wal.write_batch(&batch.operations).await?;
 
         let mem = self.memtable.read().await;
@@ -139,8 +152,9 @@ impl StorageEngine {
             .as_micros();
 
         let sst_path = self.dir.join(format!("{}.sst", id));
+        tracing::info!("Flushing MemTable to Level 0: {:?}", sst_path);
 
-        let builder = SstBuilder::new(&sst_path);
+        let builder = SstBuilder::new(&sst_path, self.config.block_size);
         builder.build_from_memtable(&old_memtable).await?;
 
         {
@@ -156,7 +170,7 @@ impl StorageEngine {
         }
 
         self.wal.reset().await?;
-        tracing::info!("Flushed MemTable to Level 0: {:?}", sst_path);
+
         Ok(())
     }
 
@@ -207,7 +221,7 @@ impl StorageEngine {
 
             let mut result = None;
 
-            for level in 0..MAX_LEVELS {
+            for level in 0..self.config.max_levels {
                 let files_in_level: Vec<u128> = active_files
                     .iter()
                     .filter(|f| f.level == level)
@@ -215,9 +229,9 @@ impl StorageEngine {
                     .collect();
 
                 let threshold = if level == 0 {
-                    L0_THRESHOLD
+                    self.config.l0_threshold
                 } else {
-                    LN_THRESHOLD
+                    self.config.ln_threshold
                 };
 
                 if files_in_level.len() >= threshold {
@@ -241,10 +255,10 @@ impl StorageEngine {
         };
 
         let next_level = target_level + 1;
-        let is_last_level = next_level == MAX_LEVELS - 1;
+        let is_last_level = next_level == self.config.max_levels - 1;
 
         tracing::info!(
-            "Compacting Level {} -> Level {} ({} files)...",
+            "Compacting Level {} -> Level {} ({} files)",
             target_level,
             next_level,
             candidates.len()
@@ -254,8 +268,10 @@ impl StorageEngine {
         let candidate_paths: Vec<(PathBuf, u128)> =
             candidates.iter().map(|c| (c.path.clone(), c.id)).collect();
 
+        let block_size = self.config.block_size;
+
         let new_sst_path = tokio::task::spawn_blocking(move || {
-            Self::run_compaction_logic(candidate_paths, dir_clone, is_last_level)
+            Self::run_compaction_logic(candidate_paths, dir_clone, is_last_level, block_size)
         })
         .await
         .map_err(|e| crate::error::LsmError::Serialization(e.to_string()))??;
@@ -287,6 +303,8 @@ impl StorageEngine {
             let _ = fs::remove_file(&reader.path).await;
         }
 
+        tracing::info!("Compaction complete");
+
         Ok(())
     }
 
@@ -294,6 +312,7 @@ impl StorageEngine {
         files: Vec<(PathBuf, u128)>,
         dir: PathBuf,
         is_last_level: bool,
+        block_size: usize,
     ) -> Result<PathBuf> {
         let mut readers = Vec::new();
         for (path, id) in &files {
@@ -315,7 +334,8 @@ impl StorageEngine {
             .as_micros();
         let new_path = dir.join(format!("{}.sst", id));
 
-        let builder = SstBuilder::new(&new_path);
+        let builder = SstBuilder::new(&new_path, block_size);
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -324,5 +344,35 @@ impl StorageEngine {
         rt.block_on(async { builder.build(merge_iter, is_last_level).await })?;
 
         Ok(new_path)
+    }
+
+    pub async fn stats(&self) -> String {
+        let mem = self.memtable.read().await;
+        let sstables = self.sstables.read().await;
+        let manifest = self.manifest.lock().await;
+
+        let mem_size = mem.approximate_size();
+        let sst_count = sstables.len();
+        let active_files_count = manifest.get_active_files().len();
+
+        let mut levels = vec![0; self.config.max_levels as usize];
+        for meta in manifest.get_active_files() {
+            if (meta.level as usize) < levels.len() {
+                levels[meta.level as usize] += 1;
+            }
+        }
+
+        format!(
+            "--- DB Stats ---\n\
+             MemTable Size: {:.2} MB\n\
+             SSTables (Active): {}\n\
+             SSTables (Loaded): {}\n\
+             Level Distribution: {:?}\n\
+             ----------------",
+            mem_size as f64 / 1024.0 / 1024.0,
+            active_files_count,
+            sst_count,
+            levels
+        )
     }
 }

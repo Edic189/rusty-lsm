@@ -55,24 +55,45 @@ impl Wal {
     }
 
     pub async fn replay(&self) -> Result<Vec<(Bytes, Option<Bytes>)>> {
-        let mut file = File::open(&self.path).await?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .await?;
         let mut results = Vec::new();
+        let mut valid_pos = 0u64;
 
         loop {
             let mut crc_buf = [0u8; 4];
             match file.read_exact(&mut crc_buf).await {
                 Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    break;
+                }
                 Err(e) => return Err(e.into()),
             }
             let expected_crc = u32::from_be_bytes(crc_buf);
 
             let mut len_buf = [0u8; 8];
-            file.read_exact(&mut len_buf).await?;
+            if let Err(_) = file.read_exact(&mut len_buf).await {
+                tracing::warn!(
+                    "WAL corrupted: Incomplete length header. Truncating to {}",
+                    valid_pos
+                );
+                file.set_len(valid_pos).await?;
+                break;
+            }
             let data_len = u64::from_be_bytes(len_buf) as usize;
 
             let mut data = vec![0u8; data_len];
-            file.read_exact(&mut data).await?;
+            if let Err(_) = file.read_exact(&mut data).await {
+                tracing::warn!(
+                    "WAL corrupted: Incomplete data body. Truncating to {}",
+                    valid_pos
+                );
+                file.set_len(valid_pos).await?;
+                break;
+            }
 
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(&len_buf);
@@ -80,10 +101,9 @@ impl Wal {
             let computed_crc = hasher.finalize();
 
             if computed_crc != expected_crc {
-                return Err(crate::error::LsmError::Corruption {
-                    expected: expected_crc,
-                    found: computed_crc,
-                });
+                tracing::warn!("WAL corrupted: CRC Mismatch. Truncating to {}", valid_pos);
+                file.set_len(valid_pos).await?;
+                break;
             }
 
             let ops: Vec<BatchOp> = bincode::deserialize(&data)
@@ -95,6 +115,8 @@ impl Wal {
                     BatchOp::Delete(k) => results.push((Bytes::from(k), None)),
                 }
             }
+
+            valid_pos = file.seek(SeekFrom::Current(0)).await?;
         }
 
         Ok(results)
@@ -102,14 +124,11 @@ impl Wal {
 
     pub async fn reset(&self) -> Result<()> {
         let mut writer = self.writer.lock().await;
-
         writer.flush().await?;
         let file = writer.get_mut();
-
         file.set_len(0).await?;
         file.seek(SeekFrom::Start(0)).await?;
         file.sync_all().await?;
-
         Ok(())
     }
 }
