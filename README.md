@@ -1,139 +1,101 @@
-# Rusty LSM: High-Performance Async Key-Value Store
+# Rusty LSM
 
-Rusty LSM is a production-grade, persistent Log-Structured Merge-Tree (LSM) storage engine written in Rust. It is built for high-throughput write operations and low-latency reads, leveraging asynchronous I/O via Tokio and modern storage techniques including memory mapping, zero-copy deserialization, and block compression.
+Rusty LSM is a high-performance, persistent key-value store based on the Log-Structured Merge-tree (LSM) architecture. It is written in Rust and operates as a standalone server implementing the Redis Serialization Protocol (RESP), making it compatible with existing Redis clients and tools.
 
-## Key Features
+The system is designed for high write throughput and low-latency reads, utilizing asynchronous I/O, memory mapping, and zero-copy deserialization.
 
-* **LSM-Tree Architecture:** Optimized for sequential writes and high ingestion rates.
-* **Data Durability:** Write-Ahead Log (WAL) with CRC32 checksums ensures zero data loss on crashes.
-* **Atomic Transactions:** Support for Atomic Write Batches (Put/Delete multiple keys in a single transaction).
-* **High-Performance Reads:**
-    * **Memory Mapping (mmap):** Bypasses syscall overhead for file I/O.
-    * **Block Cache (LRU):** Caches frequently accessed uncompressed data blocks in RAM.
-    * **Bloom Filters:** Probabilistic filtering to avoid unnecessary disk seeks.
-    * **Range Filtering:** Checks min/max key metadata before opening blocks.
-* **Storage Efficiency:**
-    * **Snappy Compression:** Blocks are compressed on disk using the Google Snappy algorithm.
-    * **Prefix Compression:** Reduces space usage by storing only key differences for sorted data.
-    * **Tombstone Garbage Collection:** Removes deleted keys during compaction at the bottom level.
-* **Zero-Copy Access:** Uses `rkyv` for deserializing data directly from memory maps without allocations.
-* **Streaming Iterators:** Memory-safe scan operations that yield items lazily, preventing OOM errors on large range scans.
+## Technical Architecture
 
-## Architecture
+### Core Components
+* **MemTable:** Utilizes `crossbeam-skiplist` for lock-free concurrent writes and reads in memory.
+* **WAL (Write-Ahead Log):** Ensures durability. All writes are appended to the log with CRC32 checksums before being applied to the MemTable. Supports automatic recovery and truncation of corrupted tail records.
+* **SSTable (Sorted String Table):** Immutable disk files structured in 4KB blocks.
+    * **Compression:** Google Snappy algorithm via `snap`.
+    * **Serialization:** Zero-copy deserialization using `rkyv`.
+    * **Indexing:** Bloom Filters for probabilistically rejecting non-existent keys and Sparse Index for locating data blocks.
+* **Manifest:** Atomic state management for tracking active file levels and generation IDs.
 
-### Write Path
-1. **WAL Append:** Operations are serialized into a batch, checksummed (CRC32), and appended to the disk log.
-2. **MemTable Insert:** Data is applied to the concurrent in-memory SkipList.
-3. **Flush:** When MemTable size exceeds the limit, it is flushed to L0 SSTable using Prefix Encoding and Snappy Compression.
+### Network Protocol
+The server implements a subset of the RESP (Redis Serialization Protocol), allowing interaction via standard Redis clients.
 
-### Read Path
-1. **MemTable:** Checks active memory buffer.
-2. **Block Cache:** Checks the in-memory LRU cache for the requested block.
-3. **SSTable Lookup:**
-    * **Bloom Filter & Range Check:** Fast rejection if key is not present.
-    * **Sparse Index:** Binary search to locate the 4KB data block.
-    * **Fetch & Verify:** Reads from disk/mmap, verifies CRC32, decompresses, and populates Cache.
+**Supported Commands:**
+* `SET key value` - Write data.
+* `GET key` - Read data.
+* `DEL key` - Delete data.
+* `EXISTS key` - Check if a key exists.
+* `PING` - Health check.
+* `FLUSHDB` - Triggers a manual flush of MemTable to disk.
+* `STATS` - Returns internal engine metrics (LSM levels, cache usage).
 
-### Compaction Strategy
-* **Leveled Compaction:** Moves data through levels (L0 -> L1 -> ... -> L7).
-* **Merge Sort:** Merges overlapping files using a k-way merge iterator.
-* **GC:** Tombstones (deletes) are physically removed when data reaches the bottom level.
+## Performance
 
-## Storage Format
+Benchmarks were conducted using `redis-benchmark` on standard hardware via Docker containerization.
 
-### SSTable (.sst)
-Files are immutable and organized into 4KB blocks:
-* **Data Block:** [Overlap | DiffKey | Value] entries -> Compressed (Snappy) -> Checksummed (CRC32).
-* **Meta Block:** Sparse Index, Bloom Filter, Min/Max Keys.
-* **Footer:** Offset pointer to the Meta Block.
+* **Write Throughput (SET):** ~20,000 requests/sec
+* **Read Throughput (GET):** ~41,000 requests/sec
+* **P50 Latency:** < 3ms
 
-### Manifest (manifest.json)
-Atomic state management tracking active files and levels, ensuring consistency across restarts.
+## Build and Run
 
-## Setup and Usage
+### Requirements
+* Rust 1.75+ (Edition 2021)
+* Docker (Optional)
 
-### Library Usage
-Add `rusty-lsm` to your project dependencies.
+### Running via Docker
+The project includes a multi-stage Dockerfile for optimized builds.
 
-```rust
-use rusty_lsm::engine::StorageEngine;
-use rusty_lsm::batch::WriteBatch;
+1.  **Build the image:**
+    ```bash
+    docker build -t rusty-lsm .
+    ```
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize engine
-    let engine = StorageEngine::new("./db_data").await?;
+2.  **Run the container:**
+    ```bash
+    # Runs on port 8080 with increased file descriptor limits for LSM handling
+    docker run -d -p 8080:8080 --ulimit nofile=65535:65535 --name rusty-lsm rusty-lsm
+    ```
 
-    // 1. Simple Put/Get
-    engine.put("user:1", "Alice").await?;
-    
-    if let Some(val) = engine.get(b"user:1").await? {
-        println!("Found: {}", String::from_utf8_lossy(&val));
-    }
-
-    // 2. Atomic Batch Write
-    let mut batch = WriteBatch::new();
-    batch.put(b"user:2", b"Bob");
-    batch.put(b"user:3", b"Charlie");
-    batch.delete(b"user:1"); // Delete Alice
-    engine.write(batch).await?;
-
-    // 3. Range Scan (Streaming)
-    // .to_vec() is required because scan expects Vec bounds
-    let iter = engine.scan(b"user:0".to_vec()..b"user:9".to_vec()).await?;
-    for (key, val) in iter {
-        println!(
-            "{} => {}", 
-            String::from_utf8_lossy(&key), 
-            String::from_utf8_lossy(&val)
-        );
-    }
-
-    // 4. Manual Maintenance (Optional)
-    engine.flush().await?;   // Force MemTable to Disk
-    engine.compact().await?; // Trigger Compaction/GC
-
-    Ok(())
-}
-```
-
-### CLI Tool
-You can run the engine as a standalone CLI.
+### Running Locally (Cargo)
 
 ```bash
-cargo run --release --bin rusty-lsm
+cargo run --release -- start --port 8080 --data-dir ./db_data
 ```
 
-| Command | Usage | Description |
-| :--- | :--- | :--- |
-| `put` | `put [k] [v]` | Insert key-value. |
-| `get` | `get [k]` | Retrieve value. |
-| `delete` | `delete [k]` | Delete key. |
-| `scan` | `scan [start] [end]` | Range scan (inclusive start, exclusive end). |
-| `flush` | `flush` | Persist memory to disk. |
-| `compact` | `compact` | Merge files and clean up deleted keys. |
+**CLI Arguments:**
+* `--port`: TCP port to listen on (default: 8080).
+* `--data-dir`: Directory for storing WAL and SSTables (default: ./db_data).
+* `--memtable-size`: Threshold in bytes for flushing to disk (default: 64MB).
+* `--block-size`: SSTable block size (default: 4KB).
 
-## Project Structure
+## Usage Example
 
-* `src/engine.rs`: Orchestrator (Put, Get, Scan, Compact).
-* `src/sstable/`: Disk format, Builder (Compression/Prefix), Reader (mmap/access).
-* `src/wal.rs`: Crash recovery log with Batch support.
-* `src/memtable.rs`: Lock-free SkipList wrapper.
-* `src/cache.rs`: Thread-safe LRU Block Cache.
-* `src/batch.rs`: Atomic write batch definition.
-* `src/iterator.rs`: Merging iterator for Scan operations.
-* `src/manifest.rs`: Metadata and level management.
+Since Rusty LSM speaks RESP, you can use `redis-cli`:
 
-## Dependencies
+```bash
+$ redis-cli -p 8080
 
-* `tokio`
-* `memmap2`
-* `bytes`
-* `lru`
-* `rkyv`
-* `serde`
-* `bincode`
-* `snap`
-* `crc32fast`
-* `bloomfilter`
-* `crossbeam-skiplist`
+127.0.0.1:8080> PING
+PONG
+127.0.0.1:8080> SET user:100 "Rustacean"
+OK
+127.0.0.1:8080> GET user:100
+"Rustacean"
+127.0.0.1:8080> STATS
+"--- DB Stats ---
+ MemTable Size: 0.12 MB
+ SSTables (Active): 4
+ Level Distribution: [2, 1, 0, 0, 0, 0, 0]
+ ----------------"
+```
+
+## Configuration & Tuning
+
+The engine's performance characteristics can be tuned via `LsmConfig`:
+
+* **block_cache_capacity:** Number of blocks to keep in the LRU cache.
+* **memtable_capacity:** Controls the frequency of flushes. Larger tables improve write performance but increase recovery time.
+* **compaction_thresholds:** Configurable triggers for L0 and Ln compaction processes.
+
+## License
+
+This project is licensed under the MIT License.
