@@ -49,7 +49,6 @@ impl Wal {
         writer.write_all(&payload).await?;
 
         writer.flush().await?;
-        writer.get_ref().sync_all().await?;
 
         Ok(())
     }
