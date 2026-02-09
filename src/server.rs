@@ -1,89 +1,155 @@
 use crate::engine::StorageEngine;
+use crate::resp::{RespHandler, RespValue};
 use anyhow::Result;
 use std::ops::Bound;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 pub async fn start_server(engine: Arc<StorageEngine>) -> Result<()> {
     let addr = format!("0.0.0.0:{}", engine.config.port);
     let listener = TcpListener::bind(&addr).await?;
 
-    tracing::info!("Server listening on {}", addr);
+    tracing::info!("Redis-compatible Server listening on {}", addr);
 
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let (socket, _) = listener.accept().await?;
         let engine = engine.clone();
 
         tokio::spawn(async move {
-            let (reader, mut writer) = socket.split();
-            let mut reader = BufReader::new(reader);
-            let mut line = String::new();
+            let mut handler = RespHandler::new(socket);
 
             loop {
-                line.clear();
-                let bytes_read = reader.read_line(&mut line).await.unwrap_or(0);
-                if bytes_read == 0 {
-                    break;
-                }
-
-                let parts: Vec<&str> = line.trim().split_whitespace().collect();
-
-                let mut response = String::new();
-
-                match parts.as_slice() {
-                    ["PUT", k, v] => match engine.put(k.to_string(), v.to_string()).await {
-                        Ok(_) => response.push_str("OK\n"),
-                        Err(e) => response.push_str(&format!("ERR: {}\n", e)),
-                    },
-                    ["GET", k] => match engine.get(k.as_bytes()).await {
-                        Ok(Some(v)) => {
-                            response.push_str(&format!("{}\n", String::from_utf8_lossy(&v)))
-                        }
-                        Ok(None) => response.push_str("(nil)\n"),
-                        Err(e) => response.push_str(&format!("ERR: {}\n", e)),
-                    },
-                    ["DEL", k] => match engine.delete(k.to_string()).await {
-                        Ok(_) => response.push_str("OK\n"),
-                        Err(e) => response.push_str(&format!("ERR: {}\n", e)),
-                    },
-                    ["SCAN", start, end] => {
-                        let start_b = Bound::Included(start.as_bytes().to_vec());
-                        let end_b = Bound::Excluded(end.as_bytes().to_vec());
-
-                        match engine.scan((start_b, end_b)).await {
-                            Ok(iter) => {
-                                let mut count = 0;
-                                for (k, v) in iter {
-                                    response.push_str(&format!(
-                                        "{}={}\n",
-                                        String::from_utf8_lossy(&k),
-                                        String::from_utf8_lossy(&v)
-                                    ));
-                                    count += 1;
-                                    if count > 1000 {
-                                        response.push_str("ERR: Scan limit reached\n");
-                                        break;
-                                    }
-                                }
-                                response.push_str("END\n");
-                            }
-                            Err(e) => response.push_str(&format!("ERR: {}\n", e)),
-                        }
+                let frame = match handler.read_value().await {
+                    Ok(Some(v)) => v,
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::error!("Connection error: {}", e);
+                        break;
                     }
-                    ["STATS"] => {
-                        // NOVA KOMANDA
-                        let stats = engine.stats().await;
-                        response.push_str(&stats);
-                        response.push('\n');
-                    }
-                    _ => response.push_str("ERR: Unknown command\n"),
                 };
 
-                if let Err(_) = writer.write_all(response.as_bytes()).await {
+                let response = if let RespValue::Array(args) = frame {
+                    if args.is_empty() {
+                        RespValue::Error("Empty command".to_string())
+                    } else {
+                        // Prvi argument je ime komande (npr. "SET")
+                        let command_name = match &args[0] {
+                            RespValue::BulkString(Some(b)) => {
+                                String::from_utf8_lossy(b).to_string().to_uppercase()
+                            }
+                            RespValue::SimpleString(s) => s.to_uppercase(),
+                            _ => String::new(),
+                        };
+
+                        match command_name.as_str() {
+                            "PING" => RespValue::SimpleString("PONG".to_string()),
+
+                            "SET" => {
+                                if args.len() < 3 {
+                                    RespValue::Error(
+                                        "ERR wrong number of arguments for 'set' command"
+                                            .to_string(),
+                                    )
+                                } else {
+                                    // SET key value
+                                    let key = extract_bytes(&args[1]);
+                                    let val = extract_bytes(&args[2]);
+
+                                    if let (Some(k), Some(v)) = (key, val) {
+                                        match engine.put(k, v).await {
+                                            Ok(_) => RespValue::SimpleString("OK".to_string()),
+                                            Err(e) => RespValue::Error(e.to_string()),
+                                        }
+                                    } else {
+                                        RespValue::Error("ERR invalid key or value".to_string())
+                                    }
+                                }
+                            }
+
+                            "GET" => {
+                                if args.len() < 2 {
+                                    RespValue::Error(
+                                        "ERR wrong number of arguments for 'get' command"
+                                            .to_string(),
+                                    )
+                                } else {
+                                    let key = extract_bytes(&args[1]);
+                                    if let Some(k) = key {
+                                        match engine.get(&k).await {
+                                            Ok(Some(v)) => RespValue::BulkString(Some(v)),
+                                            Ok(None) => RespValue::BulkString(None),
+                                            Err(e) => RespValue::Error(e.to_string()),
+                                        }
+                                    } else {
+                                        RespValue::Error("ERR invalid key".to_string())
+                                    }
+                                }
+                            }
+
+                            "DEL" => {
+                                if args.len() < 2 {
+                                    RespValue::Error(
+                                        "ERR wrong number of arguments for 'del' command"
+                                            .to_string(),
+                                    )
+                                } else {
+                                    let key = extract_bytes(&args[1]);
+                                    if let Some(k) = key {
+                                        match engine.delete(k).await {
+                                            Ok(_) => RespValue::Integer(1),
+                                            Err(e) => RespValue::Error(e.to_string()),
+                                        }
+                                    } else {
+                                        RespValue::Error("ERR invalid key".to_string())
+                                    }
+                                }
+                            }
+
+                            "KEYS" | "SCAN" => {
+                                // Pojednostavljeni SCAN koji vraća sve ključeve (oprez za velike baze!)
+                                // Redis SCAN ima cursor, ovdje simuliramo "scan all"
+                                match engine.scan(..).await {
+                                    Ok(iter) => {
+                                        let mut keys = Vec::new();
+                                        for (k, _) in iter {
+                                            keys.push(RespValue::BulkString(Some(k)));
+                                            if keys.len() >= 1000 {
+                                                break;
+                                            } // Hard limit zaštita
+                                        }
+                                        RespValue::Array(keys)
+                                    }
+                                    Err(e) => RespValue::Error(e.to_string()),
+                                }
+                            }
+
+                            "STATS" => {
+                                let stats = engine.stats().await;
+                                RespValue::SimpleString(stats)
+                            }
+
+                            _ => {
+                                RespValue::Error(format!("ERR unknown command '{}'", command_name))
+                            }
+                        }
+                    }
+                } else {
+                    RespValue::Error("ERR request must be an array".to_string())
+                };
+
+                if let Err(e) = handler.write_value(response).await {
+                    tracing::error!("Write error: {}", e);
                     break;
                 }
             }
         });
+    }
+}
+
+fn extract_bytes(val: &RespValue) -> Option<Vec<u8>> {
+    match val {
+        RespValue::BulkString(Some(v)) => Some(v.clone()),
+        RespValue::SimpleString(s) => Some(s.as_bytes().to_vec()),
+        _ => None,
     }
 }
