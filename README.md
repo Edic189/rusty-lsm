@@ -38,7 +38,7 @@ Benchmarks were conducted using `redis-benchmark` on standard hardware via Docke
 ## Build and Run
 
 ### Requirements
-* Rust 1.75+ (Edition 2021)
+* Rust 1.85 (Edition 2024)
 * Docker (Optional)
 
 ### Running via Docker
