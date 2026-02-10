@@ -9,7 +9,7 @@ pub struct LsmConfig {
     pub ln_threshold: usize,
     pub block_cache_capacity: usize,
     pub block_size: usize,
-    pub memtable_capacity: usize, // NOVO: Limit memorije (u bajtovima)
+    pub memtable_capacity: usize,
 }
 
 impl Default for LsmConfig {
@@ -22,7 +22,7 @@ impl Default for LsmConfig {
             ln_threshold: 4,
             block_cache_capacity: 1000,
             block_size: 4096,
-            memtable_capacity: 64 * 1024 * 1024, // Default: 64 MB
+            memtable_capacity: 64 * 1024 * 1024,
         }
     }
 }

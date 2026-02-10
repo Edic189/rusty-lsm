@@ -31,7 +31,6 @@ pub async fn start_server(engine: Arc<StorageEngine>) -> Result<()> {
                     if args.is_empty() {
                         RespValue::Error("Empty command".to_string())
                     } else {
-                        // Prvi argument je ime komande (npr. "SET")
                         let command_name = match &args[0] {
                             RespValue::BulkString(Some(b)) => {
                                 String::from_utf8_lossy(b).to_string().to_uppercase()
@@ -50,7 +49,6 @@ pub async fn start_server(engine: Arc<StorageEngine>) -> Result<()> {
                                             .to_string(),
                                     )
                                 } else {
-                                    // SET key value
                                     let key = extract_bytes(&args[1]);
                                     let val = extract_bytes(&args[2]);
 
@@ -104,23 +102,19 @@ pub async fn start_server(engine: Arc<StorageEngine>) -> Result<()> {
                                 }
                             }
 
-                            "KEYS" | "SCAN" => {
-                                // Pojednostavljeni SCAN koji vraća sve ključeve (oprez za velike baze!)
-                                // Redis SCAN ima cursor, ovdje simuliramo "scan all"
-                                match engine.scan(..).await {
-                                    Ok(iter) => {
-                                        let mut keys = Vec::new();
-                                        for (k, _) in iter {
-                                            keys.push(RespValue::BulkString(Some(k)));
-                                            if keys.len() >= 1000 {
-                                                break;
-                                            } // Hard limit zaštita
+                            "KEYS" | "SCAN" => match engine.scan(..).await {
+                                Ok(iter) => {
+                                    let mut keys = Vec::new();
+                                    for (k, _) in iter {
+                                        keys.push(RespValue::BulkString(Some(k)));
+                                        if keys.len() >= 1000 {
+                                            break;
                                         }
-                                        RespValue::Array(keys)
                                     }
-                                    Err(e) => RespValue::Error(e.to_string()),
+                                    RespValue::Array(keys)
                                 }
-                            }
+                                Err(e) => RespValue::Error(e.to_string()),
+                            },
 
                             "STATS" => {
                                 let stats = engine.stats().await;

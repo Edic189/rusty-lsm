@@ -11,15 +11,13 @@ pub struct SstBuilder {
     current_block: Vec<SstEntry>,
     block_index: Vec<BlockMeta>,
     current_block_size: usize,
-    target_block_size: usize, // NOVO
+    target_block_size: usize,
     bloom: Bloom<Vec<u8>>,
     min_key: Vec<u8>,
     max_key: Vec<u8>,
 }
 
 impl SstBuilder {
-    // Uklonjena const BLOCK_SIZE
-
     pub fn new(path: impl AsRef<Path>, block_size: usize) -> Self {
         let bloom = Bloom::new_for_fp_rate(10_000, 0.01);
         Self {
@@ -68,7 +66,6 @@ impl SstBuilder {
             self.current_block.push(entry);
             self.current_block_size += entry_size;
 
-            // Koristimo target_block_size iz konfiga
             if self.current_block_size >= self.target_block_size {
                 self.flush_block(&mut writer, &mut file_offset).await?;
             }
